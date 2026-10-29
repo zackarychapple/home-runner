@@ -297,8 +297,9 @@ const SH_CACHE_DIR: &str = r#"if [ -L /cache ] && [ ! -e /cache/ ]; then
 fi
 "#;
 
-/// Loads the image's environment (`~/.home-runner/env`, see images/macos-latest) and sets up the
-/// runner, then runs one job with the hooks installed and prints what they recorded. Without a
+/// Sets up the cache and the runner, loads the image's environment (`~/.home-runner/env`, see
+/// images/macos-latest; sourced once /cache is ready so it can create directories there), then
+/// runs one job with the hooks installed and prints what they recorded. Without a
 /// cache it uses a runner baked into the image if there is one; with a cache, the runner tarball
 /// for the current version is kept in /cache and unpacked fresh for each job.
 fn runner_script(
@@ -342,9 +343,9 @@ fi
     };
     format!(
         r#"set -e
-[ ! -f "$HOME/.home-runner/env" ] || . "$HOME/.home-runner/env"
 RUNNER_DIR="{runner_dir}"
-{setup}d=/tmp/home-runner-state
+{setup}[ ! -f "$HOME/.home-runner/env" ] || . "$HOME/.home-runner/env"
+d=/tmp/home-runner-state
 {exports}export HR_CPU_MODE=exe HR_EXE=/tmp/home-runner
 {hooks}set +e
 cd "$RUNNER_DIR"

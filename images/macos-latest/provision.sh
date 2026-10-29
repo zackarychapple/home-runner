@@ -45,10 +45,13 @@ mkdir -p "$HOME/Library/Caches"
 rm -rf "$HOME/Library/Caches/tauri-cef"
 ln -s /cache/tauri-cef "$HOME/Library/Caches/tauri-cef"
 
-# Sourced by home-runner before it starts the runner, so every job step sees it. rustup's proxies
-# stay in ~/.cargo/bin; CARGO_HOME only decides where the registry and installed tools go.
+# Sourced by home-runner once /cache is ready, right before it starts the runner, so every job
+# step sees it. rustup's proxies stay in ~/.cargo/bin; CARGO_HOME only decides where the registry
+# and installed tools go. Directories that links point into are created here, because a cache
+# that was just formatted or emptied has none.
 mkdir -p "$HOME/.home-runner"
 cat > "$HOME/.home-runner/env" <<ENV
+mkdir -p /cache/tauri-cef
 export RUNNER_TOOL_CACHE="$tools" AGENT_TOOLSDIRECTORY="$tools"
 export PATH="$HOME/bin:/cache/cargo/bin:$HOME/.cargo/bin:$dir/bin:/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:\$PATH"
 export RUSTUP_HOME="$HOME/.rustup" CARGO_HOME=/cache/cargo CARGO_INCREMENTAL=0
