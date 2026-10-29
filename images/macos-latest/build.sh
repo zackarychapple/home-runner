@@ -16,7 +16,7 @@ RUST_TOOLCHAIN=1.99.0
 RUST_COMPONENTS="clippy rustfmt"
 RUST_TARGETS="aarch64-apple-darwin x86_64-apple-darwin"
 SCCACHE_VERSION=0.19.0
-BREW_PACKAGES=""
+BREW_PACKAGES="cmake ninja"   # CEF (tauri-runtime-cef) builds its wrapper with CMake + Ninja
 for arg in "$@"; do
   case "$arg" in
     *=*) eval "${arg%%=*}=\"\${arg#*=}\"" ;;
