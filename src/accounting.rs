@@ -214,7 +214,7 @@ mod tests {
             org = "acme"
             [github.auth]
             type = "token"
-            file = "{}"
+            file = '{}'
             [host]
             name = "studio-m2"
             [[pool]]
