@@ -156,6 +156,22 @@ $ home-runner savings --by repo          # or --by actor | pool | host | workflo
 - **Not counted:** plan-included free minutes (GitHub Team includes 3,000 per month, Depot plans include some) and hardware cost. GitHub announced, then postponed, a $0.002/min charge for self-hosted runners on private repos; set `github_self_hosted_usd_per_minute` if it ever applies.
 - **Your cost:** electricity only, calculated as `job_watts` × job time × `electricity_usd_per_kwh`.
 
+## Dashboard
+
+```sh
+home-runner ui                                   # this machine's ledger
+home-runner ui --ledger mini.jsonl --ledger pc.jsonl --since 90d   # a whole fleet
+```
+
+A native window over the same ledger the `jobs` and `savings` commands read. It is read-only, needs no GitHub credentials, and picks up new jobs within a couple of seconds while it is open.
+
+- **Overview:** saved vs GitHub-hosted and vs Depot, job count, success rate, runner time and your cost; cumulative savings and jobs per day; the success / failed / canceled split; job duration and queue wait (average, median, p95, longest).
+- **Breakdown:** the same totals grouped by repo, actor, workflow, host/pool, host, day or month.
+- **Jobs:** every job, sortable by start, time, queue wait or savings, each linking to its GitHub run.
+- The time range and the repo, actor and host filters at the top apply to all three views. Days are UTC.
+
+Headless machines can skip the GUI dependencies with `cargo build --release --no-default-features`; release binaries include it.
+
 ## Network (UniFi)
 
 **You don't need a static public IP, port forwarding, or a "host" machine.** Runners make long-polling **outbound** HTTPS connections to GitHub, so every machine works on its own and none of them depends on another.
@@ -177,6 +193,7 @@ You'd only need inbound access for webhook-driven scale-to-zero, which this desi
 |---|---|
 | `home-runner status` | This machine's runners as GitHub sees them (idle/busy), plus lifetime savings |
 | `home-runner jobs` / `savings` | Job log and savings report (see above) |
+| `home-runner ui` | Dashboard of savings and job stats (see above) |
 | `home-runner doctor` | Checks auth, tooling and images, and prints labels |
 | Logs | `~/.home-runner/logs/` or `C:\ProgramData\home-runner\logs\`, rotated daily, kept 14 days. Runner output is included. |
 | `HOME_RUNNER_LOG=debug` | More detail |
