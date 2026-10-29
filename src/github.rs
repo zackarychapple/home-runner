@@ -146,7 +146,12 @@ impl GitHub {
 
     /// Registers a single-use runner. The returned config is all the runner needs; it deregisters
     /// itself after one job.
-    pub async fn generate_jitconfig(&self, name: &str, labels: &[String]) -> Result<JitConfig> {
+    pub async fn generate_jitconfig(
+        &self,
+        name: &str,
+        labels: &[String],
+        runner_group_id: Option<u64>,
+    ) -> Result<JitConfig> {
         #[derive(Deserialize)]
         struct RunnerId {
             id: u64,
@@ -159,7 +164,7 @@ impl GitHub {
         let url = format!("{}/actions/runners/generate-jitconfig", self.scope_url());
         let body = json!({
             "name": name,
-            "runner_group_id": self.runner_group_id,
+            "runner_group_id": runner_group_id.unwrap_or(self.runner_group_id),
             "labels": labels,
             "work_folder": "_work",
         });

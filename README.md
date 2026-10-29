@@ -116,6 +116,38 @@ jobs:
 
 `home-runner doctor` prints the exact `runs-on` for each pool.
 
+### An `ubuntu-latest`-like image with warm caches
+
+`images/ubuntu-latest/` builds an image that looks like GitHub's `ubuntu-latest` (Ubuntu 24.04, `gh`, a C toolchain, passwordless `sudo`) with the toolchains already installed, so setup steps find them instead of downloading them: Node in the runner tool cache (`actions/setup-node` resolves it locally), pnpm, a pinned Rust toolchain with sccache, and any extra apt packages. Pin versions to match your repos:
+
+```sh
+./images/ubuntu-latest/build.sh arm64 --build-arg NODE_VERSION=26 --build-arg RUST_TOOLCHAIN=1.99.0
+```
+
+```toml
+[[pool]]
+name = "ubuntu-latest"
+backend = "apple-container"
+runner_group_id = 7              # a group limited to the repos that should run here
+count = 2
+labels = ["home", "ubuntu-latest"]
+image = "home-runner/ubuntu-latest:arm64"
+pull = false                     # a local image; there is nothing to pull
+cache_size = "40G"               # persistent /cache volume per slot
+cpus = 8
+memory = "16G"
+```
+
+Use the labels in the workflow: GitHub always sends a bare `runs-on: ubuntu-latest` to its own runners, even when a self-hosted runner carries that label.
+
+```yaml
+runs-on: [self-hosted, home, ubuntu-latest]
+```
+
+**Caches.** With `cache_size`, each slot gets its own persistent volume (`<pool prefix><slot>-cache`) mounted at `/cache`, and the image points the pnpm store, npm cache, Cargo registry, sccache and Turbo cache at it. The runner's work folder lives there too, so checkouts are incremental fetches and pnpm hardlinks from its store instead of copying. If the repo uses Turbo, list `CARGO_HOME`, `RUSTC_WRAPPER` and `SCCACHE_*` in `globalPassThroughEnv`, or Turbo's strict env mode hides them from Cargo. Jobs after the first start warm without any `actions/cache` round trips, so skip those on self-hosted runners (`if: runner.environment == 'github-hosted'`). A slot owns its volume, so concurrent jobs never write to the same one. When a volume passes 85% full it's emptied before the next job and that job starts cold. To reset by hand: `container volume rm <name>` while the service is stopped.
+
+Anything a job leaves in `/cache` is visible to the next job on that slot, so give a cached pool a runner group limited to repos you trust. `runner_group_id` on a pool overrides `github.runner_group_id`. Rebuild the image to pick up new versions.
+
 ## Job log and savings
 
 Every job is written to a ledger on the machine that ran it (`~/.home-runner/jobs.jsonl`, one JSON object per line). Each entry records:

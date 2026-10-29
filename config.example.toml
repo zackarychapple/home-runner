@@ -55,6 +55,23 @@ arch = "amd64"
 cpus = 4
 memory = "8G"
 
+# An ubuntu-latest-like image with Node, pnpm and Rust preinstalled and a persistent cache per slot.
+# Build the image first: ./images/ubuntu-latest/build.sh arm64
+#   runs-on: [self-hosted, home, ubuntu-latest]
+# Use a runner group limited to the repos that should land here, since the cache carries over
+# between their jobs.
+# [[pool]]
+# name = "ubuntu-latest"
+# backend = "apple-container"
+# runner_group_id = 2
+# count = 2
+# labels = ["home", "ubuntu-latest"]
+# image = "home-runner/ubuntu-latest:arm64"
+# pull = false
+# cache_size = "40G"
+# cpus = 8
+# memory = "16G"
+
 # macOS jobs in a throwaway Tart VM (at most 2 macOS VMs per Mac).
 #   runs-on: [self-hosted, macOS, ARM64]
 [[pool]]

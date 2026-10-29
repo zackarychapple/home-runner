@@ -113,6 +113,9 @@ pub struct PoolConfig {
     /// Extra labels; `self-hosted`, the OS and the arch are always added.
     #[serde(default)]
     pub labels: Vec<String>,
+    /// Org runner group for this pool, overriding `github.runner_group_id`. Lets a pool with a
+    /// broad label (like `ubuntu-latest`) serve only the repos that group allows.
+    pub runner_group_id: Option<u64>,
     /// Hard limit on a single job, measured from when the job starts.
     #[serde(default = "default_job_timeout")]
     pub job_timeout_minutes: u64,
@@ -158,6 +161,10 @@ pub struct OciConfig {
     /// Pull the image on startup so new runner versions are picked up.
     #[serde(default = "default_true")]
     pub pull: bool,
+    /// Give each slot a persistent volume of this size (e.g. "40G") mounted at /cache, for
+    /// package stores and build caches that should survive from one job to the next. Each slot
+    /// owns its volume, so concurrent jobs never share one. Docker ignores the size.
+    pub cache_size: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
