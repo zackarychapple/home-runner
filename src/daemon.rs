@@ -256,7 +256,7 @@ async fn run_once(
     let _claim = Claim::new(&ctx.active, &name);
     let jit = ctx
         .gh
-        .generate_jitconfig(&name, &pool.labels)
+        .generate_jitconfig(&name, &pool.labels, pool.cfg.runner_group_id)
         .await
         .context("registering runner with GitHub")?;
     info!(runner = %name, "registered, waiting for a job");
