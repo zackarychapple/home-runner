@@ -97,15 +97,10 @@ impl TartBackend {
         self.copy_self(&ip).await?;
 
         let asset = self.dist.asset("osx", "arm64").await?;
-        let runner_dir = self
-            .cfg
-            .runner_dir
-            .as_deref()
-            .unwrap_or("$HOME/actions-runner");
         let mut job = self
             .ssh(&ip)
             .arg(runner_script(
-                runner_dir,
+                self.cfg.runner_dir.as_deref(),
                 &asset.url,
                 &asset.version,
                 jit_config,
@@ -279,7 +274,8 @@ impl TartBackend {
 /// A blank disk is this slot's new cache disk, so format it; the VM's own disk is never blank.
 /// macOS mounts it at /Volumes/HRCache, which the image links to /cache. HFS+, because an APFS
 /// volume on a VM's internal disk is keyed to that VM's boot disk, and the next job's fresh clone
-/// can't unlock it. HFS+ is as fast here for build trees (many small files).
+/// can't unlock it. HFS+ is as fast here for build trees (many small files). A disk that's nearly
+/// full is emptied, so a job never fails for lack of space (that job just starts cold).
 const SH_MOUNT_CACHE: &str = r#"for d in $(diskutil list physical | awk '/^\/dev\/disk/ {print $1}'); do
   diskutil list "$d" | grep -q '^ *1:' || diskutil eraseDisk JHFS+ HRCache GPT "$d" >/dev/null
 done
@@ -289,6 +285,13 @@ until mount | grep -q ' on /Volumes/HRCache '; do
   [ "$i" -lt 30 ] || { echo "home-runner: the cache disk did not mount" >&2; exit 1; }
   diskutil mount HRCache >/dev/null 2>&1 || sleep 1
 done
+c=/Volumes/HRCache
+[ -w "$c" ] || sudo -n chown "$(id -u):$(id -g)" "$c"
+used=$(df -P "$c" | awk 'NR==2 {sub("%","",$5); print $5}')
+if [ "${used:-0}" -ge 85 ]; then
+  echo "home-runner: the cache disk is ${used}% full, clearing it"
+  find "$c" -mindepth 1 -maxdepth 1 ! -name '.*' -exec rm -rf {} +
+fi
 "#;
 
 /// Without a cache disk, an image's /cache link would dangle, so give it a plain directory.
@@ -299,11 +302,14 @@ fi
 
 /// Sets up the cache and the runner, loads the image's environment (`~/.home-runner/env`, see
 /// images/macos-latest; sourced once /cache is ready so it can create directories there), then
-/// runs one job with the hooks installed and prints what they recorded. Without a
-/// cache it uses a runner baked into the image if there is one; with a cache, the runner tarball
-/// for the current version is kept in /cache and unpacked fresh for each job.
+/// runs one job with the hooks installed and prints what they recorded. Without a cache it uses a
+/// runner baked into the image if there is one. With a cache, the runner itself lives on the cache
+/// disk, so its work folder is a real directory there: checkouts become incremental fetches and
+/// build output carries over. It must not be a symlink, because `actions/checkout` registers its
+/// credentials under the path the runner reports, and git only applies them when the path it sees
+/// is the same. The runner tarball is kept too, and unpacked again when the version changes.
 fn runner_script(
-    runner_dir: &str,
+    runner_dir: Option<&str>,
     url: &str,
     version: &str,
     jit_config: &str,
@@ -316,34 +322,35 @@ fn runner_script(
         .collect();
     let setup = if cache {
         format!(
-            r#"{mount}t=/cache/actions-runner/actions-runner-osx-arm64-{version}.tar.gz
+            r#"{SH_MOUNT_CACHE}RUNNER_DIR="{runner_dir}"
+t=$c/actions-runner-dist/actions-runner-osx-arm64-{version}.tar.gz
 if [ "$(cat "$RUNNER_DIR/.home-runner-version" 2>/dev/null)" != "{version}" ]; then
   if [ ! -f "$t" ]; then
-    mkdir -p /cache/actions-runner
-    find /cache/actions-runner -name '*.tar.gz' -delete
+    rm -rf "$c/actions-runner-dist" && mkdir -p "$c/actions-runner-dist"
     curl -fsSL -o "$t.part" "{url}" && mv "$t.part" "$t"
   fi
-  rm -rf "$RUNNER_DIR" && mkdir -p "$RUNNER_DIR"
+  mkdir -p "$RUNNER_DIR"
+  find "$RUNNER_DIR" -mindepth 1 -maxdepth 1 ! -name _work -exec rm -rf {{}} +
   tar -xzf "$t" -C "$RUNNER_DIR"
   echo "{version}" > "$RUNNER_DIR/.home-runner-version"
 fi
-HR_RUNNER="$RUNNER_DIR/run.sh"
-{prep}"#,
-            mount = SH_MOUNT_CACHE,
-            prep = super::SH_CACHE_PREP,
+mkdir -p "$RUNNER_DIR/_work"
+"#,
+            runner_dir = runner_dir.unwrap_or("/Volumes/HRCache/actions-runner"),
         )
     } else {
         format!(
-            r#"{SH_CACHE_DIR}if [ ! -x "$RUNNER_DIR/run.sh" ]; then
+            r#"{SH_CACHE_DIR}RUNNER_DIR="{runner_dir}"
+if [ ! -x "$RUNNER_DIR/run.sh" ]; then
   mkdir -p "$RUNNER_DIR"
   curl -fsSL "{url}" | tar -xz -C "$RUNNER_DIR"
 fi
-"#
+"#,
+            runner_dir = runner_dir.unwrap_or("$HOME/actions-runner"),
         )
     };
     format!(
         r#"set -e
-RUNNER_DIR="{runner_dir}"
 {setup}[ ! -f "$HOME/.home-runner/env" ] || . "$HOME/.home-runner/env"
 d=/tmp/home-runner-state
 {exports}export HR_CPU_MODE=exe HR_EXE=/tmp/home-runner
@@ -401,21 +408,22 @@ mod tests {
     }
 
     #[test]
-    fn cache_script_keeps_runner_off_the_wiped_cache() {
-        let script = runner_script(
-            "$HOME/actions-runner",
-            "https://x/r.tgz",
-            "2.330.0",
-            "jit",
-            &[],
-            true,
-        );
-        let mount = script.find("eraseDisk").unwrap();
+    fn cache_script_puts_a_real_work_folder_on_the_cache_disk() {
+        let script = runner_script(None, "https://x/r.tgz", "2.330.0", "jit", &[], true);
+        let mount = script.find("eraseDisk JHFS+").unwrap();
+        let clear = script.find("is ${used}% full").unwrap();
         let unpack = script.find("tar -xzf").unwrap();
-        let prep = script.find("df -P /cache/").unwrap();
-        assert!(mount < unpack && unpack < prep);
-        assert!(script.contains("HR_RUNNER=\"$RUNNER_DIR/run.sh\""));
-        assert!(!runner_script("d", "u", "v", "j", &[], false).contains("eraseDisk"));
+        let env = script.find(".home-runner/env").unwrap();
+        assert!(mount < clear && clear < unpack && unpack < env);
+        assert!(script.contains("RUNNER_DIR=\"/Volumes/HRCache/actions-runner\""));
+        assert!(script.contains("! -name _work"));
+        assert!(
+            !script.contains("ln -s"),
+            "the work folder must not be a symlink"
+        );
+        let plain = runner_script(None, "u", "v", "j", &[], false);
+        assert!(!plain.contains("eraseDisk"));
+        assert!(plain.contains("RUNNER_DIR=\"$HOME/actions-runner\""));
     }
 
     /// Set HOME_RUNNER_DUMP to a directory to write the VM scripts there for manual testing.
@@ -423,8 +431,7 @@ mod tests {
     fn dump_runner_script() {
         if let Ok(dir) = std::env::var("HOME_RUNNER_DUMP") {
             for (file, cache) in [("tart-cache.sh", true), ("tart.sh", false)] {
-                let script =
-                    runner_script("$HOME/actions-runner", "URL", "VERSION", "JIT", &[], cache);
+                let script = runner_script(None, "URL", "VERSION", "JIT", &[], cache);
                 std::fs::write(Path::new(&dir).join(file), script).unwrap();
             }
         }

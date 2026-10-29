@@ -159,25 +159,6 @@ impl Backend {
     }
 }
 
-/// Where a pool's `cache_size` volume or disk is mounted.
-const CACHE_DIR: &str = "/cache";
-
-/// Makes a fresh cache writable by the runner user and empties one that is nearly full, so a job
-/// never fails for lack of space (that job just starts cold). The runner's work folder lives on the
-/// cache too: checkouts become incremental fetches, and package managers can hardlink from a store
-/// on the same filesystem instead of copying it. Expects `$HR_RUNNER` (path of run.sh). Paths end
-/// in `/` because /cache is a symlink to the mounted disk on macOS.
-const SH_CACHE_PREP: &str = r#"[ -w /cache/ ] || sudo -n chown "$(id -u):$(id -g)" /cache/
-used=$(df -P /cache/ | awk 'NR==2 {sub("%","",$5); print $5}')
-if [ "${used:-0}" -ge 85 ]; then
-  echo "home-runner: /cache is ${used}% full, clearing it"
-  find /cache/ -mindepth 1 -maxdepth 1 -exec rm -rf {} +
-fi
-mkdir -p /cache/_work
-w="$(dirname "$HR_RUNNER")/_work"
-[ -e "$w" ] || ln -s /cache/_work "$w"
-"#;
-
 pub fn os_label(os: &str) -> &'static str {
     match os {
         "macos" => "macOS",
