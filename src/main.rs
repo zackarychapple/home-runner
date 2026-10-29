@@ -1,15 +1,20 @@
+mod accounting;
 mod backend;
 mod config;
 mod daemon;
 mod doctor;
 mod github;
+mod hooks;
 mod init;
+mod ledger;
 mod logging;
 mod paths;
 mod power;
+mod pricing;
 mod proc;
 mod runner_dist;
 mod service;
+mod timefmt;
 
 use std::path::{Path, PathBuf};
 
@@ -88,6 +93,33 @@ enum Command {
     },
     /// Remove the background service.
     Uninstall,
+    /// List jobs this machine has run: repo, workflow, who triggered it, time, CPU and savings.
+    Jobs {
+        #[command(flatten)]
+        config: ConfigArg,
+        #[command(flatten)]
+        query: LedgerQuery,
+        /// Show at most this many (most recent) jobs.
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+        #[arg(long, value_enum, default_value = "table")]
+        format: ledger::Format,
+    },
+    /// Summarise time, CPU and money saved versus GitHub-hosted and Depot runners.
+    Savings {
+        #[command(flatten)]
+        config: ConfigArg,
+        #[command(flatten)]
+        query: LedgerQuery,
+        /// Break the totals down by this.
+        #[arg(long, value_enum, default_value = "repo")]
+        by: ledger::GroupBy,
+    },
+    /// List the hosted-runner prices used for savings estimates.
+    Prices,
+    /// Print machine-wide CPU counters (used by the job hooks).
+    #[command(hide = true)]
+    CpuSample,
     /// Entry point used by the Windows service manager.
     #[command(hide = true)]
     Service {
@@ -112,7 +144,97 @@ fn main() -> Result<()> {
             password,
         } => service::install(&config.path(), account, password),
         Command::Uninstall => service::uninstall(),
+        Command::Jobs {
+            config,
+            query,
+            limit,
+            format,
+        } => {
+            let records = query.load(&config)?;
+            ledger::print_jobs(&records, limit, format)
+        }
+        Command::Savings { config, query, by } => {
+            let records = query.load(&config)?;
+            let period = match query.since.as_str() {
+                "all" => "all time".to_string(),
+                since => format!("in the last {since}"),
+            };
+            ledger::print_savings(&records, by, &period);
+            Ok(())
+        }
+        Command::Prices => {
+            print_prices();
+            Ok(())
+        }
+        Command::CpuSample => {
+            if let Some((busy, total)) = hooks::cpu_ticks() {
+                println!("{busy} {total}");
+            }
+            Ok(())
+        }
         Command::Service { config } => service::run_service(config.path()),
+    }
+}
+
+#[derive(Args)]
+struct LedgerQuery {
+    /// How far back to look: 24h, 7d, 4w, or all.
+    #[arg(long, default_value = "30d")]
+    since: String,
+    /// Only jobs whose repo contains this.
+    #[arg(long)]
+    repo: Option<String>,
+    /// Only jobs triggered by this user.
+    #[arg(long)]
+    actor: Option<String>,
+    /// Read these ledgers instead of this machine's (repeat to combine machines).
+    #[arg(long = "ledger")]
+    ledgers: Vec<PathBuf>,
+}
+
+impl LedgerQuery {
+    fn load(&self, config: &ConfigArg) -> Result<Vec<ledger::JobRecord>> {
+        let paths = if self.ledgers.is_empty() {
+            // The ledger lives next to the config; don't require valid GitHub credentials to read it.
+            let data_dir = config::Config::load(&config.path())
+                .map(|c| c.data_dir())
+                .unwrap_or_else(|_| paths::default_data_dir());
+            vec![data_dir.join(ledger::LEDGER_FILE)]
+        } else {
+            self.ledgers.clone()
+        };
+        let since = timefmt::parse_since(&self.since)?.map(|d| timefmt::now() - d.as_secs() as i64);
+        let filter = ledger::Filter {
+            since,
+            repo: self.repo.clone(),
+            actor: self.actor.clone(),
+        };
+        Ok(filter.apply(ledger::load(&paths)?))
+    }
+}
+
+fn print_prices() {
+    println!(
+        "Hosted runner list prices (as of {}), USD per minute.",
+        pricing::PRICES_AS_OF
+    );
+    println!("GitHub rounds each job up to a whole minute; Depot bills per second.");
+    println!(
+        "Override any rate in [pricing.rates]; pick one per pool with compare_github / compare_depot.\n"
+    );
+    for sku in pricing::SKUS {
+        println!(
+            "  {:<28} {:<30} {:>3} CPU  ${:.3}{}",
+            sku.id,
+            sku.label,
+            sku.cpus,
+            sku.usd_per_minute,
+            if sku.free_for_public {
+                "  (free for public repos)"
+            } else {
+                ""
+            }
+        );
     }
 }
 

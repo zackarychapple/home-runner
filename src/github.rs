@@ -64,6 +64,14 @@ pub struct Asset {
     pub browser_download_url: String,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct WorkflowJob {
+    pub name: String,
+    pub html_url: Option<String>,
+    pub created_at: Option<String>,
+    pub runner_name: Option<String>,
+}
+
 #[derive(Debug)]
 pub struct ApiError {
     pub status: StatusCode,
@@ -195,6 +203,50 @@ impl GitHub {
             Err(e) if api_status(&e) == Some(StatusCode::NOT_FOUND) => Ok(()),
             Err(e) => Err(e),
         }
+    }
+
+    /// Whether a repository is private. Needs only the metadata permission every app has.
+    pub async fn repo_private(&self, repo: &str) -> Result<bool> {
+        #[derive(Deserialize)]
+        struct Repo {
+            private: bool,
+        }
+        let url = format!("{}/repos/{repo}", self.api);
+        let r: Repo = self.api(Method::GET, &url, None).await?.json().await?;
+        Ok(r.private)
+    }
+
+    /// Finds the job a given runner ran within a workflow run attempt. Needs "Actions: Read".
+    pub async fn find_job(
+        &self,
+        repo: &str,
+        run_id: u64,
+        attempt: u32,
+        runner: &str,
+    ) -> Result<Option<WorkflowJob>> {
+        #[derive(Deserialize)]
+        struct Page {
+            jobs: Vec<WorkflowJob>,
+        }
+        for page in 1..=10 {
+            let url = format!(
+                "{}/repos/{repo}/actions/runs/{run_id}/attempts/{attempt}/jobs?per_page=100&page={page}",
+                self.api
+            );
+            let resp: Page = self.api(Method::GET, &url, None).await?.json().await?;
+            let n = resp.jobs.len();
+            if let Some(job) = resp
+                .jobs
+                .into_iter()
+                .find(|j| j.runner_name.as_deref() == Some(runner))
+            {
+                return Ok(Some(job));
+            }
+            if n < 100 {
+                break;
+            }
+        }
+        Ok(None)
     }
 
     pub async fn latest_runner_release(&self) -> Result<Release> {

@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
@@ -8,6 +9,7 @@ use tokio::process::Command;
 use tracing::debug;
 
 use super::{Running, arch_label, os_label};
+use crate::hooks;
 use crate::proc::{self, pipe_output};
 use crate::runner_dist::{RunnerDist, host_os_arch};
 
@@ -39,18 +41,26 @@ impl HostBackend {
         Ok(())
     }
 
-    pub async fn launch(&self, name: &str, jit_config: &str) -> Result<Running> {
+    pub async fn launch(
+        &self,
+        name: &str,
+        jit_config: &str,
+        hook_env: &[(String, String)],
+    ) -> Result<Running> {
         let dir = self.work_root.join(name);
         remove_dir(&dir).await?;
         tokio::fs::create_dir_all(&dir).await?;
         let (os, arch) = host_os_arch();
         let archive = self.dist.local_archive(os, arch).await?;
         extract(&archive, &dir).await?;
+        let hooks = install_hooks(&dir).await?;
 
         let script = dir.join(if cfg!(windows) { "run.cmd" } else { "run.sh" });
         let mut cmd = Command::new(&script);
         cmd.arg("--jitconfig")
             .arg(jit_config)
+            .envs(hook_env.iter().map(|(k, v)| (k, v)))
+            .envs(hooks)
             .current_dir(&dir)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -64,8 +74,16 @@ impl HostBackend {
         let mut child = cmd
             .spawn()
             .with_context(|| format!("starting {}", script.display()))?;
-        let job_started = pipe_output(&mut child, name);
-        Ok(Running::new(child, None, true, job_started))
+        let watch = pipe_output(&mut child, name);
+        Ok(Running::new(child, None, true, watch))
+    }
+
+    pub async fn collect(&self, name: &str) -> HashMap<String, String> {
+        let path = self.work_root.join(name).join("hr-state").join("job.env");
+        match tokio::fs::read_to_string(&path).await {
+            Ok(text) => hooks::parse_env(&text),
+            Err(_) => HashMap::new(),
+        }
     }
 
     pub async fn cleanup(&self, name: &str) -> Result<()> {
@@ -98,6 +116,43 @@ impl HostBackend {
             asset.version, asset.name
         ))
     }
+}
+
+/// Writes the job hooks into the runner directory and returns the env vars that enable them.
+/// CPU is sampled machine-wide by this binary (`home-runner cpu-sample`).
+async fn install_hooks(dir: &Path) -> Result<Vec<(String, String)>> {
+    let hook_dir = dir.join("hr-hooks");
+    tokio::fs::create_dir_all(&hook_dir).await?;
+    let ext = if cfg!(windows) { "ps1" } else { "sh" };
+    let (started, completed) = if cfg!(windows) {
+        (hooks::ps_started(), hooks::ps_completed())
+    } else {
+        (hooks::sh_started(), hooks::sh_completed())
+    };
+    let started_path = hook_dir.join(format!("started.{ext}"));
+    let completed_path = hook_dir.join(format!("completed.{ext}"));
+    tokio::fs::write(&started_path, started).await?;
+    tokio::fs::write(&completed_path, completed).await?;
+    #[cfg(unix)]
+    for path in [&started_path, &completed_path] {
+        use std::os::unix::fs::PermissionsExt;
+        tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).await?;
+    }
+    let exe = std::env::current_exe()?;
+    let path = |p: &Path| p.display().to_string();
+    Ok(vec![
+        (
+            "ACTIONS_RUNNER_HOOK_JOB_STARTED".into(),
+            path(&started_path),
+        ),
+        (
+            "ACTIONS_RUNNER_HOOK_JOB_COMPLETED".into(),
+            path(&completed_path),
+        ),
+        ("HR_STATE_DIR".into(), path(&dir.join("hr-state"))),
+        ("HR_CPU_MODE".into(), "exe".into()),
+        ("HR_EXE".into(), path(&exe)),
+    ])
 }
 
 fn tar_program() -> String {

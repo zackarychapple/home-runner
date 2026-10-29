@@ -2,16 +2,16 @@ mod host;
 mod oci;
 mod tart;
 
+use std::collections::HashMap;
 use std::path::Path;
 use std::process::ExitStatus;
 use std::sync::Arc;
 
 use anyhow::{Result, anyhow};
 use tokio::process::Child;
-use tokio::sync::watch;
 
 use crate::config::BackendConfig;
-use crate::proc;
+use crate::proc::{self, JobWatch};
 use crate::runner_dist::RunnerDist;
 
 use host::HostBackend;
@@ -31,21 +31,16 @@ pub struct Running {
     job: Child,
     vm: Option<Child>,
     tree_kill: bool,
-    pub job_started: watch::Receiver<bool>,
+    pub watch: JobWatch,
 }
 
 impl Running {
-    fn new(
-        job: Child,
-        vm: Option<Child>,
-        tree_kill: bool,
-        job_started: watch::Receiver<bool>,
-    ) -> Self {
+    fn new(job: Child, vm: Option<Child>, tree_kill: bool, watch: JobWatch) -> Self {
         Self {
             job,
             vm,
             tree_kill,
-            job_started,
+            watch,
         }
     }
 
@@ -104,11 +99,35 @@ impl Backend {
         }
     }
 
-    pub async fn launch(&self, name: &str, jit_config: &str) -> Result<Running> {
+    /// Number of CPUs a job gets, used to pick a comparable hosted runner.
+    pub fn cpus(&self) -> u32 {
         match self {
-            Backend::Host(b) => b.launch(name, jit_config).await,
-            Backend::Oci(b) => b.launch(name, jit_config).await,
-            Backend::Tart(b) => b.launch(name, jit_config).await,
+            Backend::Host(_) => host_cpus(),
+            Backend::Oci(b) => b.cpus(),
+            Backend::Tart(b) => b.cpus(),
+        }
+    }
+
+    /// Starts a runner for one job. `hook_env` is passed to the job hooks (see `hooks`).
+    pub async fn launch(
+        &self,
+        name: &str,
+        jit_config: &str,
+        hook_env: &[(String, String)],
+    ) -> Result<Running> {
+        match self {
+            Backend::Host(b) => b.launch(name, jit_config, hook_env).await,
+            Backend::Oci(b) => b.launch(name, jit_config, hook_env).await,
+            Backend::Tart(b) => b.launch(name, jit_config, hook_env).await,
+        }
+    }
+
+    /// Job metadata the hooks wrote that isn't in the runner's output (host backend only; the
+    /// others print it). Call after the runner exits and before `cleanup`.
+    pub async fn collect(&self, name: &str) -> HashMap<String, String> {
+        match self {
+            Backend::Host(b) => b.collect(name).await,
+            Backend::Oci(_) | Backend::Tart(_) => HashMap::new(),
         }
     }
 
@@ -153,4 +172,8 @@ pub fn arch_label(arch: &str) -> &'static str {
         "aarch64" | "arm64" => "ARM64",
         _ => "X64",
     }
+}
+
+pub fn host_cpus() -> u32 {
+    std::thread::available_parallelism().map_or(1, |n| n.get() as u32)
 }

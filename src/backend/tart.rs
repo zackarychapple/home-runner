@@ -9,6 +9,7 @@ use tracing::info;
 
 use super::Running;
 use crate::config::TartConfig;
+use crate::hooks;
 use crate::paths::expand_home;
 use crate::proc::{self, output, pipe_output};
 use crate::runner_dist::RunnerDist;
@@ -41,7 +42,17 @@ impl TartBackend {
         Ok(())
     }
 
-    pub async fn launch(&self, name: &str, jit_config: &str) -> Result<Running> {
+    pub fn cpus(&self) -> u32 {
+        // Cirrus Labs images default to 4 vCPUs.
+        self.cfg.cpus.unwrap_or(4)
+    }
+
+    pub async fn launch(
+        &self,
+        name: &str,
+        jit_config: &str,
+        hook_env: &[(String, String)],
+    ) -> Result<Running> {
         output("tart", &["clone", &self.cfg.image, name]).await?;
         let mut set = vec!["set".to_string(), name.into()];
         if let Some(cpus) = self.cfg.cpus {
@@ -70,6 +81,8 @@ impl TartBackend {
             status = vm.wait() => bail!("VM exited while booting ({status:?})"),
         };
         self.wait_for_ssh(&ip).await?;
+        // The hooks call `home-runner cpu-sample` inside the VM to read macOS CPU counters.
+        self.copy_self(&ip).await?;
 
         let asset = self.dist.asset("osx", "arm64").await?;
         let runner_dir = self
@@ -79,15 +92,33 @@ impl TartBackend {
             .unwrap_or("$HOME/actions-runner");
         let mut job = self
             .ssh(&ip)
-            .arg(runner_script(runner_dir, &asset.url, jit_config))
+            .arg(runner_script(runner_dir, &asset.url, jit_config, hook_env))
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true)
             .spawn()
             .map_err(|e| proc::spawn_error("ssh", e))?;
-        let job_started = pipe_output(&mut job, name);
-        Ok(Running::new(job, Some(vm), false, job_started))
+        let watch = pipe_output(&mut job, name);
+        Ok(Running::new(job, Some(vm), false, watch))
+    }
+
+    async fn copy_self(&self, ip: &str) -> Result<()> {
+        let exe = std::fs::File::open(std::env::current_exe()?)?;
+        let status = self
+            .ssh(ip)
+            .arg("cat > /tmp/home-runner && chmod +x /tmp/home-runner")
+            .stdin(Stdio::from(exe))
+            .stdout(Stdio::null())
+            .kill_on_drop(true)
+            .status()
+            .await
+            .map_err(|e| proc::spawn_error("ssh", e))?;
+        anyhow::ensure!(
+            status.success(),
+            "copying home-runner into the VM failed ({status})"
+        );
+        Ok(())
     }
 
     pub async fn cleanup(&self, name: &str) -> Result<()> {
@@ -199,8 +230,18 @@ impl TartBackend {
     }
 }
 
-/// Uses a runner baked into the image if there is one, otherwise downloads it, then runs one job.
-fn runner_script(runner_dir: &str, url: &str, jit_config: &str) -> String {
+/// Uses a runner baked into the image if there is one, otherwise downloads it, then runs one job
+/// with the hooks installed and prints what they recorded.
+fn runner_script(
+    runner_dir: &str,
+    url: &str,
+    jit_config: &str,
+    hook_env: &[(String, String)],
+) -> String {
+    let exports: String = hook_env
+        .iter()
+        .map(|(k, v)| format!("export {k}={}\n", sh_quote(v)))
+        .collect();
     format!(
         r#"set -e
 RUNNER_DIR="{runner_dir}"
@@ -208,7 +249,19 @@ if [ ! -x "$RUNNER_DIR/run.sh" ]; then
   mkdir -p "$RUNNER_DIR"
   curl -fsSL "{url}" | tar -xz -C "$RUNNER_DIR"
 fi
+d=/tmp/home-runner-state
+{exports}export HR_CPU_MODE=exe HR_EXE=/tmp/home-runner
+{hooks}set +e
 cd "$RUNNER_DIR"
-exec ./run.sh --jitconfig '{jit_config}'"#
+./run.sh --jitconfig '{jit_config}'
+rc=$?
+{emit}
+exit $rc"#,
+        hooks = hooks::sh_install_fragment(),
+        emit = hooks::SH_EMIT,
     )
+}
+
+fn sh_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', r"'\''"))
 }

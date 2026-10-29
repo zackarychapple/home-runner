@@ -24,6 +24,15 @@ name = "studio-m2"
 # Keeps the Mac awake while home-runner runs.
 prevent_sleep = true
 
+# Savings estimates in the job ledger (`home-runner jobs`, `home-runner savings`).
+[pricing]
+electricity_usd_per_kwh = 0.17      # your power price
+job_watts = 30                      # extra draw while a job runs
+annotate_jobs = true                # post "saved ~$X" on each workflow run
+# github_self_hosted_usd_per_minute = 0.002   # if GitHub's postponed self-hosted fee ever applies
+# [pricing.rates]                   # override list prices; ids from `home-runner prices`
+# github-linux-arm64-4 = 0.008
+
 # Linux arm64 jobs, one lightweight VM per job via Apple's `container`.
 #   runs-on: [self-hosted, Linux, ARM64]
 [[pool]]
@@ -51,6 +60,7 @@ memory = "8G"
 [[pool]]
 name = "macos"
 backend = "tart"
+compare_github = "github-macos-arm64-3"   # price against the standard M1 runner, not the 5-core
 count = 1
 labels = ["home"]
 image = "ghcr.io/cirruslabs/macos-sequoia-xcode:latest"

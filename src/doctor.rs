@@ -14,7 +14,7 @@ pub async fn run(path: &Path) -> Result<()> {
         config.runner_prefix()
     );
 
-    let (gh, pools) = daemon::build(&config)?;
+    let daemon::Built { gh, pools, .. } = daemon::build(&config)?;
     let mut failures = 0;
 
     match gh.list_runners().await {
@@ -47,6 +47,12 @@ pub async fn run(path: &Path) -> Result<()> {
             }
         }
         println!("    runs-on: [{}]", pool.labels.join(", "));
+        let compare: Vec<_> = [pool.pricing.github, pool.pricing.depot]
+            .into_iter()
+            .flatten()
+            .map(|s| format!("{} (${}/min)", s.label, s.usd_per_minute))
+            .collect();
+        println!("    priced against: {}", compare.join(", "));
     }
 
     if failures > 0 {

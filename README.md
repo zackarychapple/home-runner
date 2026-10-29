@@ -37,6 +37,7 @@ Create a GitHub App under your org's **Settings → Developer settings → GitHu
 - Permissions:
   - Org-wide runners: **Organization → Self-hosted runners: Read and write**.
   - Repo-level runners (personal accounts): **Repository → Administration: Read and write**.
+  - Optional, for the job ledger: **Repository → Actions: Read**. This adds each job's direct URL and queue time. **Metadata: Read** (on by default) lets home-runner tell public repos from private ones.
 - Install it on the org, note the **App ID**, and generate a **private key** (`.pem`).
 
 Copy the `.pem` to each machine. Alternatively, use a fine-grained PAT with the same permission and set `type = "token"`, `file = "…"`.
@@ -115,6 +116,46 @@ jobs:
 
 `home-runner doctor` prints the exact `runs-on` for each pool.
 
+## Job log and savings
+
+Every job is written to a ledger on the machine that ran it (`~/.home-runner/jobs.jsonl`, one JSON object per line). Each entry records:
+- repo, workflow, job, run link, who triggered it, event, branch and commit
+- when it started, how long it took and how long it waited in GitHub's queue
+- the result, and CPU used
+- what the same job would have cost on the closest GitHub-hosted and Depot runners
+
+```console
+$ home-runner jobs --since 7d
+STARTED (UTC)     REPO          WORKFLOW / JOB      ACTOR     POOL         TIME  RESULT     CPU   SAVED
+2026-10-29 09:12  acme/mobile   CI / build          mona      linux       1h34m  Succeeded  50%   $0.75
+2026-10-29 10:05  acme/app      CI / build          hubot     linux      41m55s  Failed     50%   $0.33
+
+$ home-runner savings --by repo          # or --by actor | pool | host | workflow | day | month
+  GitHub-hosted would have cost   $1.23
+  Depot would have cost           $1.84
+  your cost (power + fees)        $0.01
+  saved vs GitHub                 $1.22
+  ...
+```
+
+- `--repo`, `--actor`, `--since 24h|7d|4w|all` filter either command.
+- `--format csv|json` exports for spreadsheets or dashboards.
+- To report across the whole fleet, copy each machine's ledger and pass them all, e.g. `--ledger mini.jsonl --ledger pc.jsonl`.
+- With `annotate_jobs = true`, each workflow run also shows a notice such as *"Ran on studio-m2. About $0.79 saved vs GitHub macOS 3-core M1 (13 billable min)."*
+
+**How the numbers are estimated**
+
+- **Job details:** GitHub's runner job hooks (`ACTIONS_RUNNER_HOOK_JOB_STARTED/COMPLETED`) run small scripts inside each job. They record the `GITHUB_*` variables and sample CPU counters, and they never fail the job.
+- **CPU:**
+  - Apple container VMs: the VM's `/proc/stat`.
+  - Docker: the container's cgroup.
+  - Tart VMs and host jobs: machine-wide counters through `home-runner cpu-sample`. For host jobs this includes anything else the machine was doing at the same time.
+- **Comparable runner:** by default, the smallest hosted runner with the same OS and arch and at least as many CPUs. Pin a specific one per pool with `compare_github` / `compare_depot`. `home-runner prices` lists every id and rate.
+- **Billing rules:** GitHub rounds every job up to a whole minute; Depot bills per second. Standard GitHub runners are free for public repos, so those jobs count as $0 saved.
+- **Prices:** list prices as of 2026-10-29, from [GitHub](https://docs.github.com/en/billing/reference/actions-runner-pricing) and [Depot](https://depot.dev/docs/github-actions/runner-types). If they change, override any rate in `[pricing.rates]`.
+- **Not counted:** plan-included free minutes (GitHub Team includes 3,000 per month, Depot plans include some) and hardware cost. GitHub announced, then postponed, a $0.002/min charge for self-hosted runners on private repos; set `github_self_hosted_usd_per_minute` if it ever applies.
+- **Your cost:** electricity only, calculated as `job_watts` × job time × `electricity_usd_per_kwh`.
+
 ## Network (UniFi)
 
 **You don't need a static public IP, port forwarding, or a "host" machine.** Runners make long-polling **outbound** HTTPS connections to GitHub, so every machine works on its own and none of them depends on another.
@@ -134,7 +175,8 @@ You'd only need inbound access for webhook-driven scale-to-zero, which this desi
 
 | | |
 |---|---|
-| `home-runner status` | This machine's runners as GitHub sees them (idle/busy) |
+| `home-runner status` | This machine's runners as GitHub sees them (idle/busy), plus lifetime savings |
+| `home-runner jobs` / `savings` | Job log and savings report (see above) |
 | `home-runner doctor` | Checks auth, tooling and images, and prints labels |
 | Logs | `~/.home-runner/logs/` or `C:\ProgramData\home-runner\logs\`, rotated daily, kept 14 days. Runner output is included. |
 | `HOME_RUNNER_LOG=debug` | More detail |

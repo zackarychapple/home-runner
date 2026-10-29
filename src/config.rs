@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail, ensure};
@@ -12,8 +12,39 @@ pub struct Config {
     pub github: GithubConfig,
     #[serde(default)]
     pub host: HostConfig,
+    #[serde(default)]
+    pub pricing: PricingConfig,
     #[serde(default, rename = "pool")]
     pub pools: Vec<PoolConfig>,
+}
+
+/// Inputs for the savings estimates in the job ledger.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct PricingConfig {
+    /// What you pay for power; 0.17 is roughly the US residential average.
+    pub electricity_usd_per_kwh: f64,
+    /// Extra power a machine draws while running a job (an M-series Mac mini under load is ~20-40 W).
+    pub job_watts: f64,
+    /// GitHub proposed (then postponed) a per-minute charge for self-hosted runners on private
+    /// repos. Set this if it ever applies to you.
+    pub github_self_hosted_usd_per_minute: f64,
+    /// Post a "saved ~$X" notice on each workflow run.
+    pub annotate_jobs: bool,
+    /// Override any built-in per-minute price by SKU id, e.g. `github-linux-arm64-4 = 0.008`.
+    pub rates: HashMap<String, f64>,
+}
+
+impl Default for PricingConfig {
+    fn default() -> Self {
+        Self {
+            electricity_usd_per_kwh: 0.17,
+            job_watts: 30.0,
+            github_self_hosted_usd_per_minute: 0.0,
+            annotate_jobs: true,
+            rates: HashMap::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -85,6 +116,11 @@ pub struct PoolConfig {
     /// Hard limit on a single job, measured from when the job starts.
     #[serde(default = "default_job_timeout")]
     pub job_timeout_minutes: u64,
+    /// GitHub-hosted runner to price jobs against (a `home-runner prices` id). Defaults to the
+    /// smallest one with at least as many CPUs, same OS and arch.
+    pub compare_github: Option<String>,
+    /// Depot runner to price jobs against.
+    pub compare_depot: Option<String>,
     #[serde(flatten)]
     pub backend: BackendConfig,
 }
@@ -196,6 +232,10 @@ impl Config {
             .unwrap_or_else(paths::default_data_dir)
     }
 
+    pub fn ledger_path(&self) -> PathBuf {
+        self.data_dir().join(crate::ledger::LEDGER_FILE)
+    }
+
     pub fn log_dir(&self) -> PathBuf {
         self.data_dir().join("logs")
     }
@@ -240,6 +280,18 @@ impl Config {
                     pool.backend.kind()
                 ),
                 BackendConfig::Host(_) | BackendConfig::Docker(_) => {}
+            }
+            for (id, provider) in [
+                (&pool.compare_github, crate::pricing::Provider::GitHub),
+                (&pool.compare_depot, crate::pricing::Provider::Depot),
+            ] {
+                if let Some(id) = id {
+                    ensure!(
+                        crate::pricing::find(id).is_some_and(|s| s.provider == provider),
+                        "pool {:?}: unknown {provider:?} runner {id:?} (see `home-runner prices`)",
+                        pool.name
+                    );
+                }
             }
             if let BackendConfig::Tart(tart) = &pool.backend {
                 macos_vms += pool.count;

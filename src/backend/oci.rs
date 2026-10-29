@@ -7,6 +7,7 @@ use tracing::{debug, info, warn};
 
 use super::{Running, arch_label};
 use crate::config::OciConfig;
+use crate::hooks;
 use crate::proc::{self, output, pipe_output};
 
 #[derive(Clone, Copy)]
@@ -73,7 +74,20 @@ impl OciBackend {
         Ok(())
     }
 
-    pub async fn launch(&self, name: &str, jit_config: &str) -> Result<Running> {
+    pub fn cpus(&self) -> u32 {
+        // Apple's container defaults to 4 CPUs per container; Docker shares every host CPU.
+        self.cfg.cpus.unwrap_or(match self.kind {
+            OciKind::AppleContainer => 4,
+            OciKind::Docker => super::host_cpus(),
+        })
+    }
+
+    pub async fn launch(
+        &self,
+        name: &str,
+        jit_config: &str,
+        hook_env: &[(String, String)],
+    ) -> Result<Running> {
         let mut args: Vec<String> = vec!["run".into(), "--rm".into(), "--name".into(), name.into()];
         if let Some(cpus) = self.cfg.cpus {
             args.extend(["--cpus".into(), cpus.to_string()]);
@@ -82,11 +96,26 @@ impl OciBackend {
             args.extend(["--memory".into(), memory.clone()]);
         }
         args.extend(self.arch_args());
+        // Apple's containers are whole VMs, so /proc/stat is the job's; Docker shares a VM, so use
+        // the container's own cgroup.
+        let cpu_mode = match self.kind {
+            OciKind::AppleContainer => "procstat",
+            OciKind::Docker => "usec",
+        };
+        let env = hook_env.iter().cloned().chain([
+            ("HR_CPU_MODE".to_string(), cpu_mode.to_string()),
+            ("HR_RUNNER".to_string(), self.cfg.runner_path.clone()),
+        ]);
+        for (k, v) in env {
+            args.extend(["--env".into(), format!("{k}={v}")]);
+        }
         args.extend(self.cfg.extra_args.iter().cloned());
         args.push(self.cfg.image.clone());
         args.extend([
-            self.cfg.runner_path.clone(),
-            "--jitconfig".into(),
+            "/bin/sh".into(),
+            "-c".into(),
+            wrapper_script(),
+            "home-runner".into(),
             jit_config.into(),
         ]);
 
@@ -98,8 +127,8 @@ impl OciBackend {
             .kill_on_drop(true)
             .spawn()
             .map_err(|e| proc::spawn_error(self.program(), e))?;
-        let job_started = pipe_output(&mut child, name);
-        Ok(Running::new(child, None, false, job_started))
+        let watch = pipe_output(&mut child, name);
+        Ok(Running::new(child, None, false, watch))
     }
 
     pub async fn cleanup(&self, name: &str) -> Result<()> {
@@ -160,6 +189,16 @@ impl OciBackend {
     }
 }
 
+/// Installs the job hooks, runs the runner (JIT config in $1), then prints what the hooks recorded
+/// so it survives the container being removed.
+fn wrapper_script() -> String {
+    format!(
+        "d=/tmp/home-runner\n{}\"$HR_RUNNER\" --jitconfig \"$1\"\nrc=$?\n{}\nexit $rc\n",
+        hooks::sh_install_fragment(),
+        hooks::SH_EMIT
+    )
+}
+
 /// Apple's container services stop on reboot until something starts them again.
 async fn ensure_apple_container_running() -> Result<()> {
     if output("container", &["system", "status"]).await.is_ok() {
@@ -175,5 +214,20 @@ async fn ensure_apple_container_running() -> Result<()> {
         Err(_) => anyhow::bail!(
             "`container system start` timed out; run it once in a terminal to finish first-time setup"
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// Set HOME_RUNNER_DUMP to a directory to write the container wrapper there for manual testing.
+    #[test]
+    fn dump_wrapper() {
+        if let Ok(dir) = std::env::var("HOME_RUNNER_DUMP") {
+            std::fs::write(
+                std::path::Path::new(&dir).join("wrapper.sh"),
+                super::wrapper_script(),
+            )
+            .unwrap();
+        }
     }
 }

@@ -4,12 +4,13 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow};
 use tokio::sync::OnceCell;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
+use crate::accounting::{Accounting, PoolPricing};
 use crate::backend::Backend;
 use crate::config::{Config, PoolConfig};
 use crate::github::GitHub;
@@ -27,6 +28,8 @@ pub struct Pool {
     pub labels: Vec<String>,
     /// Every runner/VM/container in this pool is named `<prefix><slot>-<id>`.
     pub prefix: String,
+    pub pricing: PoolPricing,
+    hook_env: Vec<(String, String)>,
     ready: OnceCell<()>,
 }
 
@@ -42,6 +45,7 @@ impl Pool {
 
 struct Ctx {
     gh: Arc<GitHub>,
+    accounting: Arc<Accounting>,
     host_prefix: String,
     /// Names of runners a slot is currently responsible for. Reconcile never touches these.
     active: Mutex<HashSet<String>>,
@@ -74,10 +78,22 @@ enum Outcome {
     Shutdown,
 }
 
-pub fn build(config: &Config) -> Result<(Arc<GitHub>, Vec<Arc<Pool>>)> {
+pub struct Built {
+    pub gh: Arc<GitHub>,
+    pub accounting: Arc<Accounting>,
+    pub pools: Vec<Arc<Pool>>,
+}
+
+pub fn build(config: &Config) -> Result<Built> {
     let gh = Arc::new(GitHub::from_config(&config.github)?);
     let data_dir = config.data_dir();
     let dist = Arc::new(RunnerDist::new(gh.clone(), data_dir.join("cache")));
+    let accounting = Arc::new(Accounting::new(
+        gh.clone(),
+        config.pricing.clone(),
+        config.host_name(),
+        config.ledger_path(),
+    ));
     let host_prefix = config.runner_prefix();
     let pools = config
         .pools
@@ -85,16 +101,24 @@ pub fn build(config: &Config) -> Result<(Arc<GitHub>, Vec<Arc<Pool>>)> {
         .map(|cfg| {
             let backend = Backend::new(&cfg.backend, &data_dir, dist.clone());
             let labels = labels(&backend, cfg);
+            let platform = backend.platform_labels();
+            let pricing = PoolPricing::new(cfg, &platform[0], &platform[1], backend.cpus());
             Arc::new(Pool {
                 prefix: format!("{host_prefix}{}-", cfg.name),
+                hook_env: accounting.hook_env(&pricing),
                 cfg: cfg.clone(),
                 backend,
                 labels,
+                pricing,
                 ready: OnceCell::new(),
             })
         })
         .collect();
-    Ok((gh, pools))
+    Ok(Built {
+        gh,
+        accounting,
+        pools,
+    })
 }
 
 fn labels(backend: &Backend, pool: &PoolConfig) -> Vec<String> {
@@ -128,9 +152,14 @@ fn lock_instance(config: &Config) -> Result<File> {
 pub async fn run(config: Config, shutdown: CancellationToken) -> Result<()> {
     let _lock = lock_instance(&config)?;
     let _awake = config.host.prevent_sleep.then(power::prevent_sleep);
-    let (gh, pools) = build(&config)?;
+    let Built {
+        gh,
+        accounting,
+        pools,
+    } = build(&config)?;
     let ctx = Arc::new(Ctx {
         gh,
+        accounting,
         host_prefix: config.runner_prefix(),
         active: Mutex::default(),
     });
@@ -146,6 +175,7 @@ pub async fn run(config: Config, shutdown: CancellationToken) -> Result<()> {
             backend = pool.cfg.backend.kind(),
             count = pool.cfg.count,
             labels = %pool.labels.join(","),
+            compare = %pool.pricing.github.map(|s| s.label).unwrap_or("-"),
             "pool configured"
         );
     }
@@ -231,7 +261,7 @@ async fn run_once(
         .context("registering runner with GitHub")?;
     info!(runner = %name, "registered, waiting for a job");
 
-    let result = drive(pool, &name, &jit.encoded, shutdown).await;
+    let result = drive(ctx, pool, &name, &jit.encoded, shutdown).await;
 
     if let Err(e) = pool.backend.cleanup(&name).await {
         warn!(runner = %name, "cleanup failed, reconcile will retry: {e:#}");
@@ -243,6 +273,7 @@ async fn run_once(
 }
 
 async fn drive(
+    ctx: &Ctx,
     pool: &Pool,
     name: &str,
     jit_config: &str,
@@ -250,16 +281,19 @@ async fn drive(
 ) -> Result<Outcome> {
     let launched = Instant::now();
     let mut running = tokio::select! {
-        r = pool.backend.launch(name, jit_config) => r.context("launching runner")?,
+        r = pool.backend.launch(name, jit_config, &pool.hook_env) => r.context("launching runner")?,
         _ = shutdown.cancelled() => return Ok(Outcome::Shutdown),
     };
 
     // The timeout clock starts when a job starts, so idle runners can wait indefinitely.
     let timeout = Duration::from_secs(pool.cfg.job_timeout_minutes * 60);
-    let mut job_started = running.job_started.clone();
-    let deadline = async move {
-        let _ = job_started.wait_for(|started| *started).await;
-        tokio::time::sleep(timeout).await;
+    let mut watch = running.watch.clone();
+    let deadline = {
+        let mut watch = watch.clone();
+        async move {
+            watch.wait_started().await;
+            tokio::time::sleep(timeout).await;
+        }
     };
 
     enum Event {
@@ -273,31 +307,50 @@ async fn drive(
         _ = shutdown.cancelled() => Event::Shutdown,
     };
 
-    match event {
-        Event::Exited(status) => {
-            let status = status?;
+    // `forced` is the ledger result when the runner never got to report one.
+    let (outcome, forced) = match event {
+        Event::Exited(Ok(status)) => {
             let elapsed = launched.elapsed();
-            // A runner that never picked up a job had a bad config, lost its registration or failed to
-            // start; back off instead of hammering GitHub with registrations.
-            if !*running.job_started.borrow() && elapsed < QUICK_EXIT {
-                bail!(
-                    "runner exited after {}s without running a job ({status})",
-                    elapsed.as_secs()
-                );
+            // A runner that never picked up a job had a bad config, lost its registration or failed
+            // to start; back off instead of hammering GitHub with registrations.
+            if !watch.has_started() && elapsed < QUICK_EXIT {
+                (
+                    Err(anyhow!(
+                        "runner exited after {}s without running a job ({status})",
+                        elapsed.as_secs()
+                    )),
+                    None,
+                )
+            } else {
+                info!(runner = %name, %status, "runner finished");
+                (Ok(Outcome::Completed), None)
             }
-            info!(runner = %name, %status, minutes = elapsed.as_secs() / 60, "runner finished");
-            Ok(Outcome::Completed)
         }
+        Event::Exited(Err(e)) => (Err(e), Some("VmCrashed")),
         Event::TimedOut => {
             warn!(runner = %name, "job exceeded {} minutes; killing it", pool.cfg.job_timeout_minutes);
             running.kill().await;
-            Ok(Outcome::Completed)
+            (Ok(Outcome::Completed), Some("TimedOut"))
         }
         Event::Shutdown => {
             running.kill().await;
-            Ok(Outcome::Shutdown)
+            (Ok(Outcome::Shutdown), Some("Interrupted"))
         }
+    };
+
+    if watch.has_started() {
+        // Hook output arrives on stdout just before the runner exits; let it drain.
+        watch.drained(Duration::from_secs(5)).await;
+        let mut info = watch.snapshot();
+        if info.result.is_none() {
+            info.result = Some(forced.unwrap_or("Unknown").to_string());
+        }
+        info.meta.extend(pool.backend.collect(name).await);
+        ctx.accounting
+            .record(name, &pool.cfg, &pool.pricing, info)
+            .await;
     }
+    outcome
 }
 
 /// Deletes GitHub registrations and backend resources that carry this machine's prefix but that
@@ -361,6 +414,10 @@ pub async fn status(path: &Path) -> Result<()> {
         .filter(|r| r.name.starts_with(&prefix))
         .collect();
     runners.sort_by(|a, b| a.name.cmp(&b.name));
+    let ledger = crate::ledger::load(&[config.ledger_path()]).unwrap_or_default();
+    if let Some(summary) = crate::ledger::summary_line(&ledger) {
+        println!("  lifetime: {summary}");
+    }
     println!();
     if runners.is_empty() {
         println!("no runners registered for this host (is home-runner running?)");
@@ -381,9 +438,14 @@ pub async fn status(path: &Path) -> Result<()> {
 pub async fn cleanup(path: &Path) -> Result<()> {
     let config = Config::load(path)?;
     let _lock = lock_instance(&config)?;
-    let (gh, pools) = build(&config)?;
+    let Built {
+        gh,
+        accounting,
+        pools,
+    } = build(&config)?;
     let ctx = Ctx {
         gh,
+        accounting,
         host_prefix: config.runner_prefix(),
         active: Mutex::default(),
     };
