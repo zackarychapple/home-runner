@@ -98,7 +98,7 @@ impl OciBackend {
         args.extend(self.arch_args());
         if self.cfg.cache_size.is_some() {
             let volume = self.cache_volume(name).await?;
-            args.extend(["--volume".into(), format!("{volume}:{CACHE_DIR}")]);
+            args.extend(["--volume".into(), format!("{volume}:{}", super::CACHE_DIR)]);
         }
         // Apple's containers are whole VMs, so /proc/stat is the job's; Docker shares a VM, so use
         // the container's own cgroup.
@@ -214,30 +214,12 @@ impl OciBackend {
     }
 }
 
-/// Where a pool's `cache_size` volume is mounted.
-const CACHE_DIR: &str = "/cache";
-
-/// Makes a fresh cache volume writable by the runner user and empties one that is nearly full, so
-/// a job never fails for lack of space (that job just starts cold). The runner's work folder lives
-/// on the volume too: checkouts become incremental fetches, and package managers can hardlink from
-/// a store on the same filesystem instead of copying it.
-const SH_CACHE_PREP: &str = r#"[ -w /cache ] || sudo -n chown "$(id -u):$(id -g)" /cache
-used=$(df -P /cache | awk 'NR==2 {sub("%","",$5); print $5}')
-if [ "${used:-0}" -ge 85 ]; then
-  echo "home-runner: /cache is ${used}% full, clearing it"
-  find /cache -mindepth 1 -maxdepth 1 -exec rm -rf {} +
-fi
-mkdir -p /cache/_work
-w="$(dirname "$HR_RUNNER")/_work"
-[ -e "$w" ] || ln -s /cache/_work "$w"
-"#;
-
 /// Installs the job hooks, runs the runner (JIT config in $1), then prints what the hooks recorded
 /// so it survives the container being removed.
 fn wrapper_script(cache: bool) -> String {
     format!(
         "d=/tmp/home-runner\n{}{}\"$HR_RUNNER\" --jitconfig \"$1\"\nrc=$?\n{}\nexit $rc\n",
-        if cache { SH_CACHE_PREP } else { "" },
+        if cache { super::SH_CACHE_PREP } else { "" },
         hooks::sh_install_fragment(),
         hooks::SH_EMIT
     )

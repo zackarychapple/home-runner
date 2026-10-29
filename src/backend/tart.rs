@@ -1,3 +1,4 @@
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -17,12 +18,18 @@ use crate::runner_dist::RunnerDist;
 /// macOS jobs in a Tart VM cloned (copy-on-write) from a golden image and deleted after one job.
 pub struct TartBackend {
     cfg: TartConfig,
+    /// Where each slot's `cache_size` disk image lives on the host.
+    cache_dir: PathBuf,
     dist: Arc<RunnerDist>,
 }
 
 impl TartBackend {
-    pub fn new(cfg: TartConfig, dist: Arc<RunnerDist>) -> Self {
-        Self { cfg, dist }
+    pub fn new(cfg: TartConfig, data_dir: &Path, dist: Arc<RunnerDist>) -> Self {
+        Self {
+            cfg,
+            cache_dir: data_dir.join("tart-cache"),
+            dist,
+        }
     }
 
     pub fn platform_labels(&self) -> Vec<String> {
@@ -65,8 +72,13 @@ impl TartBackend {
             output("tart", &set).await?;
         }
 
+        let mut run = vec!["run".to_string(), name.into(), "--no-graphics".into()];
+        if let Some(size) = &self.cfg.cache_size {
+            let disk = self.cache_disk(name, size)?;
+            run.push(format!("--disk={}", disk.display()));
+        }
         let mut vm = Command::new("tart")
-            .args(["run", name, "--no-graphics"])
+            .args(&run)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -92,7 +104,14 @@ impl TartBackend {
             .unwrap_or("$HOME/actions-runner");
         let mut job = self
             .ssh(&ip)
-            .arg(runner_script(runner_dir, &asset.url, jit_config, hook_env))
+            .arg(runner_script(
+                runner_dir,
+                &asset.url,
+                &asset.version,
+                jit_config,
+                hook_env,
+                self.cfg.cache_size.is_some(),
+            ))
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -101,6 +120,23 @@ impl TartBackend {
             .map_err(|e| proc::spawn_error("ssh", e))?;
         let watch = pipe_output(&mut job, name);
         Ok(Running::new(job, Some(vm), false, watch))
+    }
+
+    /// Creates the slot's cache disk the first time it's needed, as a sparse file that only takes
+    /// up what has been written. Runner names are `<prefix><slot>-<id>`, so every VM a slot
+    /// launches gets `<prefix><slot>-cache.img`. The VM formats it on first boot.
+    fn cache_disk(&self, runner: &str, size: &str) -> Result<PathBuf> {
+        let slot = runner.rsplit_once('-').map_or(runner, |(slot, _)| slot);
+        let path = self.cache_dir.join(format!("{slot}-cache.img"));
+        if !path.exists() {
+            let bytes = parse_size(size)?;
+            std::fs::create_dir_all(&self.cache_dir)?;
+            let file = std::fs::File::create_new(&path)
+                .with_context(|| format!("creating cache disk {}", path.display()))?;
+            file.set_len(bytes)?;
+            info!(disk = %path.display(), size, "creating cache disk");
+        }
+        Ok(path)
     }
 
     async fn copy_self(&self, ip: &str) -> Result<()> {
@@ -150,14 +186,24 @@ impl TartBackend {
             let key = expand_home(key);
             anyhow::ensure!(key.exists(), "ssh_key {} does not exist", key.display());
         }
+        if let Some(size) = &self.cfg.cache_size {
+            parse_size(size)?;
+        }
         let pulled = self.vm_names().await?.contains(&self.cfg.image);
         Ok(format!(
-            "tart {version}; image {} {}",
+            "tart {version}; image {} {}{}",
             self.cfg.image,
             if pulled {
                 "(present)"
             } else {
                 "(not pulled yet; first start will download it)"
+            },
+            match &self.cfg.cache_size {
+                Some(size) => format!(
+                    "; {size} cache disk per slot in {}",
+                    self.cache_dir.display()
+                ),
+                None => String::new(),
             }
         ))
     }
@@ -230,31 +276,81 @@ impl TartBackend {
     }
 }
 
-/// Uses a runner baked into the image if there is one, otherwise downloads it, then runs one job
-/// with the hooks installed and prints what they recorded.
+/// A blank disk is this slot's new cache disk, so format it; the VM's own disk is never blank.
+/// macOS mounts it at /Volumes/HRCache, which the image links to /cache. HFS+, because an APFS
+/// volume on a VM's internal disk is keyed to that VM's boot disk, and the next job's fresh clone
+/// can't unlock it. HFS+ is as fast here for build trees (many small files).
+const SH_MOUNT_CACHE: &str = r#"for d in $(diskutil list physical | awk '/^\/dev\/disk/ {print $1}'); do
+  diskutil list "$d" | grep -q '^ *1:' || diskutil eraseDisk JHFS+ HRCache GPT "$d" >/dev/null
+done
+i=0
+until mount | grep -q ' on /Volumes/HRCache '; do
+  i=$((i + 1))
+  [ "$i" -lt 30 ] || { echo "home-runner: the cache disk did not mount" >&2; exit 1; }
+  diskutil mount HRCache >/dev/null 2>&1 || sleep 1
+done
+"#;
+
+/// Without a cache disk, an image's /cache link would dangle, so give it a plain directory.
+const SH_CACHE_DIR: &str = r#"if [ -L /cache ] && [ ! -e /cache/ ]; then
+  sudo -n mkdir -p "$(readlink /cache)" && sudo -n chown "$(id -u):$(id -g)" "$(readlink /cache)"
+fi
+"#;
+
+/// Loads the image's environment (`~/.home-runner/env`, see images/macos-latest) and sets up the
+/// runner, then runs one job with the hooks installed and prints what they recorded. Without a
+/// cache it uses a runner baked into the image if there is one; with a cache, the runner tarball
+/// for the current version is kept in /cache and unpacked fresh for each job.
 fn runner_script(
     runner_dir: &str,
     url: &str,
+    version: &str,
     jit_config: &str,
     hook_env: &[(String, String)],
+    cache: bool,
 ) -> String {
     let exports: String = hook_env
         .iter()
         .map(|(k, v)| format!("export {k}={}\n", sh_quote(v)))
         .collect();
-    format!(
-        r#"set -e
-RUNNER_DIR="{runner_dir}"
-if [ ! -x "$RUNNER_DIR/run.sh" ]; then
+    let setup = if cache {
+        format!(
+            r#"{mount}t=/cache/actions-runner/actions-runner-osx-arm64-{version}.tar.gz
+if [ "$(cat "$RUNNER_DIR/.home-runner-version" 2>/dev/null)" != "{version}" ]; then
+  if [ ! -f "$t" ]; then
+    mkdir -p /cache/actions-runner
+    find /cache/actions-runner -name '*.tar.gz' -delete
+    curl -fsSL -o "$t.part" "{url}" && mv "$t.part" "$t"
+  fi
+  rm -rf "$RUNNER_DIR" && mkdir -p "$RUNNER_DIR"
+  tar -xzf "$t" -C "$RUNNER_DIR"
+  echo "{version}" > "$RUNNER_DIR/.home-runner-version"
+fi
+HR_RUNNER="$RUNNER_DIR/run.sh"
+{prep}"#,
+            mount = SH_MOUNT_CACHE,
+            prep = super::SH_CACHE_PREP,
+        )
+    } else {
+        format!(
+            r#"{SH_CACHE_DIR}if [ ! -x "$RUNNER_DIR/run.sh" ]; then
   mkdir -p "$RUNNER_DIR"
   curl -fsSL "{url}" | tar -xz -C "$RUNNER_DIR"
 fi
-d=/tmp/home-runner-state
+"#
+        )
+    };
+    format!(
+        r#"set -e
+[ ! -f "$HOME/.home-runner/env" ] || . "$HOME/.home-runner/env"
+RUNNER_DIR="{runner_dir}"
+{setup}d=/tmp/home-runner-state
 {exports}export HR_CPU_MODE=exe HR_EXE=/tmp/home-runner
 {hooks}set +e
 cd "$RUNNER_DIR"
 ./run.sh --jitconfig '{jit_config}'
 rc=$?
+sync
 {emit}
 exit $rc"#,
         hooks = hooks::sh_install_fragment(),
@@ -262,6 +358,74 @@ exit $rc"#,
     )
 }
 
+/// Parses sizes like "100G", "512M" or "1T" (powers of 1024; a trailing "B" or "iB" is fine).
+fn parse_size(size: &str) -> Result<u64> {
+    let s = size.trim().to_ascii_uppercase();
+    let s = s.trim_end_matches("IB").trim_end_matches('B');
+    let (digits, unit) = s.split_at(s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len()));
+    let shift = match unit {
+        "" => 0,
+        "K" => 10,
+        "M" => 20,
+        "G" => 30,
+        "T" => 40,
+        _ => bail!("cache_size {size:?}: use a size like \"100G\""),
+    };
+    let n: u64 = digits
+        .parse()
+        .with_context(|| format!("cache_size {size:?}: use a size like \"100G\""))?;
+    n.checked_mul(1 << shift)
+        .filter(|&b| b > 0)
+        .with_context(|| format!("cache_size {size:?} is out of range"))
+}
+
 fn sh_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', r"'\''"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_sizes() {
+        assert_eq!(parse_size("100G").unwrap(), 100 << 30);
+        assert_eq!(parse_size("512mib").unwrap(), 512 << 20);
+        assert_eq!(parse_size("1TB").unwrap(), 1 << 40);
+        assert_eq!(parse_size("4096").unwrap(), 4096);
+        assert!(parse_size("").is_err());
+        assert!(parse_size("0G").is_err());
+        assert!(parse_size("ten gigs").is_err());
+        assert!(parse_size("99999999999T").is_err());
+    }
+
+    #[test]
+    fn cache_script_keeps_runner_off_the_wiped_cache() {
+        let script = runner_script(
+            "$HOME/actions-runner",
+            "https://x/r.tgz",
+            "2.330.0",
+            "jit",
+            &[],
+            true,
+        );
+        let mount = script.find("eraseDisk").unwrap();
+        let unpack = script.find("tar -xzf").unwrap();
+        let prep = script.find("df -P /cache/").unwrap();
+        assert!(mount < unpack && unpack < prep);
+        assert!(script.contains("HR_RUNNER=\"$RUNNER_DIR/run.sh\""));
+        assert!(!runner_script("d", "u", "v", "j", &[], false).contains("eraseDisk"));
+    }
+
+    /// Set HOME_RUNNER_DUMP to a directory to write the VM scripts there for manual testing.
+    #[test]
+    fn dump_runner_script() {
+        if let Ok(dir) = std::env::var("HOME_RUNNER_DUMP") {
+            for (file, cache) in [("tart-cache.sh", true), ("tart.sh", false)] {
+                let script =
+                    runner_script("$HOME/actions-runner", "URL", "VERSION", "JIT", &[], cache);
+                std::fs::write(Path::new(&dir).join(file), script).unwrap();
+            }
+        }
+    }
 }
