@@ -98,7 +98,8 @@ impl OciBackend {
         args.extend(self.arch_args());
         if self.cfg.cache_size.is_some() {
             let volume = self.cache_volume(name).await?;
-            args.extend(["--volume".into(), format!("{volume}:{CACHE_DIR}")]);
+            let work = self.work_dir();
+            args.extend(["--volume".into(), format!("{volume}:{work}")]);
         }
         // Apple's containers are whole VMs, so /proc/stat is the job's; Docker shares a VM, so use
         // the container's own cgroup.
@@ -133,6 +134,15 @@ impl OciBackend {
             .map_err(|e| proc::spawn_error(self.program(), e))?;
         let watch = pipe_output(&mut child, name);
         Ok(Running::new(child, None, false, watch))
+    }
+
+    /// The runner's work folder (`_work` next to run.sh). The cache volume is mounted here, as the
+    /// real directory rather than behind a symlink: `actions/checkout` registers its credentials
+    /// under the logical path, and git only matches them when the path it sees is the same one.
+    fn work_dir(&self) -> String {
+        let runner = std::path::Path::new(&self.cfg.runner_path);
+        let dir = runner.parent().map_or_else(String::new, |p| p.display().to_string());
+        format!("{dir}/_work")
     }
 
     /// Creates the slot's cache volume the first time it's needed. Runner names are
@@ -214,22 +224,24 @@ impl OciBackend {
     }
 }
 
-/// Where a pool's `cache_size` volume is mounted.
-const CACHE_DIR: &str = "/cache";
-
-/// Makes a fresh cache volume writable by the runner user and empties one that is nearly full, so
-/// a job never fails for lack of space (that job just starts cold). The runner's work folder lives
-/// on the volume too: checkouts become incremental fetches, and package managers can hardlink from
-/// a store on the same filesystem instead of copying it.
-const SH_CACHE_PREP: &str = r#"[ -w /cache ] || sudo -n chown "$(id -u):$(id -g)" /cache
-used=$(df -P /cache | awk 'NR==2 {sub("%","",$5); print $5}')
+/// Makes a fresh volume writable by the runner user and empties one that is nearly full, so a job
+/// never fails for lack of space (that job just starts cold). The volume is the runner's work
+/// folder, so checkouts become incremental fetches and package managers can hardlink from a store
+/// on the same filesystem instead of copying it. `/cache`, where the image keeps its package
+/// stores and build caches, is a symlink to a hidden folder inside it. (`_work` itself must not be
+/// the symlink; see `work_dir`.)
+const SH_CACHE_PREP: &str = r#"w="$(dirname "$HR_RUNNER")/_work"
+[ -w "$w" ] || sudo -n chown "$(id -u):$(id -g)" "$w"
+used=$(df -P "$w" | awk 'NR==2 {sub("%","",$5); print $5}')
 if [ "${used:-0}" -ge 85 ]; then
-  echo "home-runner: /cache is ${used}% full, clearing it"
-  find /cache -mindepth 1 -maxdepth 1 -exec rm -rf {} +
+  echo "home-runner: $w is ${used}% full, clearing it"
+  find "$w" -mindepth 1 -maxdepth 1 -exec rm -rf {} +
 fi
-mkdir -p /cache/_work
-w="$(dirname "$HR_RUNNER")/_work"
-[ -e "$w" ] || ln -s /cache/_work "$w"
+mkdir -p "$w/.cache"
+if [ ! -L /cache ]; then
+  sudo -n rmdir /cache 2>/dev/null
+  sudo -n ln -s "$w/.cache" /cache
+fi
 "#;
 
 /// Installs the job hooks, runs the runner (JIT config in $1), then prints what the hooks recorded
