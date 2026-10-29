@@ -1,0 +1,41 @@
+[package]
+name = "home-runner"
+version = "0.1.0"
+edition = "2024"
+description = "Turn spare Macs and PCs into ephemeral, self-healing GitHub Actions runners"
+license = "MIT"
+repository = "https://github.com/zackarychapple/home-runner"
+readme = "README.md"
+keywords = ["github-actions", "ci", "self-hosted", "runner", "macos"]
+categories = ["command-line-utilities", "development-tools"]
+publish = false
+
+[dependencies]
+anyhow = "1"
+base64 = "0.22"
+clap = { version = "4", features = ["derive"] }
+gethostname = "1"
+# native-tls keeps the build free of C toolchains: Security.framework on macOS, SChannel on Windows.
+reqwest = { version = "0.12", default-features = false, features = ["json", "native-tls"] }
+rsa = "0.9"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = { version = "0.10", features = ["oid"] }
+tokio = { version = "1", features = ["full"] }
+tokio-util = "0.7"
+toml = "0.9"
+tracing = "0.1"
+tracing-appender = "0.2"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-service = "0.8"
+windows-sys = { version = "0.61", features = ["Win32_System_Power"] }
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true

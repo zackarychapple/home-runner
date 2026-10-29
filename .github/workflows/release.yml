@@ -1,0 +1,62 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - os: macos-14
+            target: aarch64-apple-darwin
+          - os: macos-14
+            target: x86_64-apple-darwin
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - run: cargo test --locked
+        if: matrix.target != 'x86_64-apple-darwin'
+      - run: cargo build --release --locked --target ${{ matrix.target }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: |
+            target/${{ matrix.target }}/release/home-runner
+            target/${{ matrix.target }}/release/home-runner.exe
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: macos-14
+    steps:
+      - uses: actions/download-artifact@v4
+      - name: Package
+        run: |
+          mkdir dist
+          # One binary for every Mac, Intel or Apple Silicon.
+          lipo -create -output dist/home-runner aarch64-apple-darwin/home-runner x86_64-apple-darwin/home-runner
+          chmod +x dist/home-runner
+          tar -czf dist/home-runner-macos-universal.tar.gz -C dist home-runner
+          rm dist/home-runner
+          cp x86_64-pc-windows-msvc/home-runner.exe dist/home-runner-windows-x64.exe
+          cd dist && shasum -a 256 * > SHA256SUMS
+      - uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          files: dist/*
+      - uses: actions/upload-artifact@v4
+        if: "!startsWith(github.ref, 'refs/tags/')"
+        with:
+          name: dist
+          path: dist/*

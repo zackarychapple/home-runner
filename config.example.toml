@@ -1,0 +1,61 @@
+# home-runner config for an Apple Silicon Mac (M1–M4).
+# `home-runner init` writes a version of this tailored to the machine it runs on.
+
+[github]
+# Org-level runners (recommended): any repo in the org can use them.
+org = "your-org"
+# Personal accounts can't have org runners; register per repo instead:
+# repo = "owner/name"
+# runner_group_id = 1          # org runner group; 1 = "Default"
+
+[github.auth]
+# A GitHub App is the durable choice: tokens are minted on demand and never expire on you.
+# Org permission needed: "Self-hosted runners: Read and write" (repo scope: "Administration: Read and write").
+type = "app"
+app_id = 123456
+private_key_path = "~/.home-runner/github-app.pem"
+# Or a personal access token stored in a file:
+# type = "token"
+# file = "~/.home-runner/token"
+
+[host]
+# Must be unique per machine. Prefixes every runner, VM and container this machine creates.
+name = "studio-m2"
+# Keeps the Mac awake while home-runner runs.
+prevent_sleep = true
+
+# Linux arm64 jobs, one lightweight VM per job via Apple's `container`.
+#   runs-on: [self-hosted, Linux, ARM64]
+[[pool]]
+name = "linux-arm64"
+backend = "apple-container"
+count = 2
+labels = ["home"]
+image = "ghcr.io/actions/actions-runner:latest"
+cpus = 4
+memory = "8G"
+
+# Linux x64 jobs through Rosetta. Slower than native, fine for most builds.
+#   runs-on: [self-hosted, Linux, X64]
+[[pool]]
+name = "linux-x64"
+backend = "apple-container"
+count = 1
+labels = ["home"]
+arch = "amd64"
+cpus = 4
+memory = "8G"
+
+# macOS jobs in a throwaway Tart VM (at most 2 macOS VMs per Mac).
+#   runs-on: [self-hosted, macOS, ARM64]
+[[pool]]
+name = "macos"
+backend = "tart"
+count = 1
+labels = ["home"]
+image = "ghcr.io/cirruslabs/macos-sequoia-xcode:latest"
+cpus = 4
+memory_mb = 8192
+ssh_user = "admin"
+ssh_password = "admin"          # Cirrus Labs image default; or bake a key in and set ssh_key
+job_timeout_minutes = 240
