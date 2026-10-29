@@ -181,6 +181,11 @@ pub struct TartConfig {
     pub ssh_password: Option<String>,
     /// Where the runner lives (or gets downloaded to) inside the VM.
     pub runner_dir: Option<String>,
+    /// Give each slot a persistent disk image of this size (e.g. "100G", sparse on the host),
+    /// formatted APFS and mounted at /cache in the VM, for package stores and build caches that
+    /// should survive from one job to the next. Needs an image with the /cache link (see
+    /// images/macos-latest). Each slot owns its disk, so concurrent jobs never share one.
+    pub cache_size: Option<String>,
 }
 
 impl BackendConfig {

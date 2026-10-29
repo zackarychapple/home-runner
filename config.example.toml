@@ -72,7 +72,9 @@ memory = "8G"
 # cpus = 8
 # memory = "16G"
 
-# macOS jobs in a throwaway Tart VM (at most 2 macOS VMs per Mac).
+# macOS jobs in a throwaway Tart VM (at most 2 macOS VMs per Mac). For an image with Node, pnpm,
+# Rust and sccache preinstalled and a persistent cache disk per slot, see images/macos-latest and
+# set image = "home-runner-macos-latest", ssh_key and cache_size = "150G".
 #   runs-on: [self-hosted, macOS, ARM64]
 [[pool]]
 name = "macos"

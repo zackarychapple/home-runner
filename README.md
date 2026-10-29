@@ -148,6 +148,36 @@ runs-on: [self-hosted, home, ubuntu-latest]
 
 Anything a job leaves in `/cache` is visible to the next job on that slot, so give a cached pool a runner group limited to repos you trust. `runner_group_id` on a pool overrides `github.runner_group_id`. Rebuild the image to pick up new versions.
 
+### A `macos-latest`-like Tart image with warm caches
+
+`images/macos-latest/` does the same for macOS: it clones Cirrus Labs' macOS + Xcode image, installs Node (in the runner tool cache), pnpm, a pinned Rust toolchain with both Apple targets (for universal builds) and sccache, points the caches at `/cache`, and authorizes your SSH key. It builds a local VM named `home-runner-macos-latest` and needs a free macOS VM slot (macOS allows two VMs at a time), so stop the service or a pool first if two are running.
+
+```sh
+./images/macos-latest/build.sh RUST_TOOLCHAIN=1.99.0 NODE_VERSION=26 PNPM_VERSION=10.33.1
+```
+
+```toml
+[[pool]]
+name = "macos"
+backend = "tart"
+runner_group_id = 7
+count = 1
+labels = ["home", "macos-latest"]
+image = "home-runner-macos-latest"
+ssh_key = "~/.home-runner/tart_ed25519"
+cache_size = "150G"              # sparse disk image per slot, mounted at /cache
+cpus = 8
+memory_mb = 16384
+```
+
+```yaml
+runs-on: [self-hosted, home, macos-latest]
+```
+
+**Caches.** With `cache_size`, each slot gets a sparse disk image (`~/.home-runner/tart-cache/<pool prefix><slot>-cache.img`) attached to its VM. The VM formats it on first use and mounts it at `/cache`; the pnpm store, Cargo registry, sccache, Turbo cache, CEF downloads (`~/Library/Caches/tauri-cef`), the runner itself and its work folder live there. The work folder is a real directory on the disk (`/Volumes/HRCache/actions-runner/_work`), not a symlink, because `actions/checkout` registers its credentials under the path the runner reports and git only applies them when the path it sees matches. It's a disk rather than a shared folder because build trees are many small files: a shared folder (virtiofs) measured 8–23x slower for that than the VM's own disk, and the cache disk measured the same as the VM's own disk. It's HFS+ because an APFS volume on a VM's internal disk is keyed to that VM's boot disk, which is a fresh clone every job. `actions/checkout` cleans untracked files by default, which deletes build output (`target/`, `node_modules`) from the work folder; use `clean: false` and a `git clean -ffdx -e target -e node_modules` step to keep it. The same 85% rule and trust rule as above apply. To reset by hand, stop the service and delete the image file.
+
+**Keeping release builds trustworthy.** A build cache is keyed by what goes into a build, but its contents are whatever a previous job wrote, so a job from any branch that can reach the pool could leave poisoned objects that a later release build reuses. Give release builds their own pool (so their own cache) in a runner group restricted to the release workflow on your default branch (`restricted_to_workflows` with `selected_workflows` like `org/repo/.github/workflows/release.yml@refs/heads/main`). Release builds stay warm, because only release builds write that cache. Keep signing material out of `/cache`: import it into a temporary keychain under `/tmp`, since the work folder (including `$RUNNER_TEMP`) is on the cache.
+
 ## Job log and savings
 
 Every job is written to a ledger on the machine that ran it (`~/.home-runner/jobs.jsonl`, one JSON object per line). Each entry records:

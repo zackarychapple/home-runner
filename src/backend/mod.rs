@@ -77,7 +77,7 @@ impl Backend {
                 Backend::Oci(OciBackend::new(OciKind::AppleContainer, c.clone()))
             }
             BackendConfig::Docker(c) => Backend::Oci(OciBackend::new(OciKind::Docker, c.clone())),
-            BackendConfig::Tart(c) => Backend::Tart(TartBackend::new(c.clone(), dist)),
+            BackendConfig::Tart(c) => Backend::Tart(TartBackend::new(c.clone(), data_dir, dist)),
         }
     }
 
