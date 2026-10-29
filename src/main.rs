@@ -15,6 +15,8 @@ mod proc;
 mod runner_dist;
 mod service;
 mod timefmt;
+#[cfg(feature = "ui")]
+mod ui;
 
 use std::path::{Path, PathBuf};
 
@@ -115,6 +117,14 @@ enum Command {
         #[arg(long, value_enum, default_value = "repo")]
         by: ledger::GroupBy,
     },
+    /// Open the dashboard: money saved, job counts and other job stats, updating live.
+    #[cfg(feature = "ui")]
+    Ui {
+        #[command(flatten)]
+        config: ConfigArg,
+        #[command(flatten)]
+        query: LedgerQuery,
+    },
     /// List the hosted-runner prices used for savings estimates.
     Prices,
     /// Print machine-wide CPU counters (used by the job hooks).
@@ -162,6 +172,8 @@ fn main() -> Result<()> {
             ledger::print_savings(&records, by, &period);
             Ok(())
         }
+        #[cfg(feature = "ui")]
+        Command::Ui { config, query } => ui::run(query.paths(&config), query.since),
         Command::Prices => {
             print_prices();
             Ok(())
@@ -193,8 +205,8 @@ struct LedgerQuery {
 }
 
 impl LedgerQuery {
-    fn load(&self, config: &ConfigArg) -> Result<Vec<ledger::JobRecord>> {
-        let paths = if self.ledgers.is_empty() {
+    fn paths(&self, config: &ConfigArg) -> Vec<PathBuf> {
+        if self.ledgers.is_empty() {
             // The ledger lives next to the config; don't require valid GitHub credentials to read it.
             let data_dir = config::Config::load(&config.path())
                 .map(|c| c.data_dir())
@@ -202,7 +214,11 @@ impl LedgerQuery {
             vec![data_dir.join(ledger::LEDGER_FILE)]
         } else {
             self.ledgers.clone()
-        };
+        }
+    }
+
+    fn load(&self, config: &ConfigArg) -> Result<Vec<ledger::JobRecord>> {
+        let paths = self.paths(config);
         let since = timefmt::parse_since(&self.since)?.map(|d| timefmt::now() - d.as_secs() as i64);
         let filter = ledger::Filter {
             since,
