@@ -58,6 +58,64 @@ pub struct JobRecord {
     pub self_hosted_fee_usd: f64,
     pub saved_vs_github_usd: Option<f64>,
     pub saved_vs_depot_usd: Option<f64>,
+
+    /// Where the job's time went, step by step, as GitHub recorded it.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub steps: Vec<StepRecord>,
+    /// What the persistent `/cache` held and how much the job used it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache: Option<CacheStats>,
+    /// Memory and disk use while the job ran.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resources: Option<Resources>,
+    /// How long the runner took to become ready for a job.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub startup: Option<Startup>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct StepRecord {
+    pub name: String,
+    pub number: u32,
+    pub conclusion: Option<String>,
+    pub secs: f64,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CacheStats {
+    /// `/cache` already held a meaningful amount of data when the job started.
+    pub warm: bool,
+    /// sccache requests, hits and misses during the job (counters are zeroed at job start).
+    pub sccache_requests: Option<u64>,
+    pub sccache_hits: Option<u64>,
+    pub sccache_misses: Option<u64>,
+    /// Size in KiB of each cache directory (`cargo`, `sccache`, `pnpm-store`, `npm`, `turbo`) when
+    /// the job started (what the previous job left) and when it ended.
+    pub start_kb: BTreeMap<String, u64>,
+    pub end_kb: BTreeMap<String, u64>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Resources {
+    pub mem_peak_kb: Option<u64>,
+    pub mem_total_kb: Option<u64>,
+    /// Bytes read from and written to disk during the job (Linux runners).
+    pub disk_read_bytes: Option<u64>,
+    pub disk_write_bytes: Option<u64>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Startup {
+    /// Registering the runner with GitHub.
+    pub register_secs: Option<f64>,
+    /// Creating and booting the VM or container, up to the point the runner script starts.
+    pub launch_secs: Option<f64>,
+    /// From the start of the launch until the runner reported "Listening for Jobs".
+    pub ready_secs: Option<f64>,
 }
 
 pub fn append(path: &Path, record: &JobRecord) -> Result<()> {

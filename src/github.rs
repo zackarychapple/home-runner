@@ -109,6 +109,20 @@ pub struct WorkflowJob {
     pub html_url: Option<String>,
     pub created_at: Option<String>,
     pub runner_name: Option<String>,
+    #[serde(default)]
+    pub status: String,
+    #[serde(default)]
+    pub steps: Vec<WorkflowStep>,
+}
+
+/// One step of a job, with the times GitHub recorded for it.
+#[derive(Debug, Clone, Deserialize)]
+pub struct WorkflowStep {
+    pub name: String,
+    pub number: u32,
+    pub conclusion: Option<String>,
+    pub started_at: Option<String>,
+    pub completed_at: Option<String>,
 }
 
 #[derive(Debug)]

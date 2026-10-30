@@ -16,6 +16,7 @@ mod power;
 mod prereq;
 mod pricing;
 mod proc;
+mod profile;
 mod runner_dist;
 mod selftest;
 mod service;
@@ -171,6 +172,22 @@ enum Command {
         #[arg(long, value_enum, default_value = "repo")]
         by: ledger::GroupBy,
     },
+    /// Show where jobs spend their time (steps, queueing, runner startup), whether the caches are
+    /// warm and hitting, and how much memory jobs use.
+    Profile {
+        #[command(flatten)]
+        config: ConfigArg,
+        #[command(flatten)]
+        query: LedgerQuery,
+        /// Only jobs whose workflow or job name contains this.
+        #[arg(long)]
+        job: Option<String>,
+        /// How many jobs and steps to list.
+        #[arg(long, default_value_t = 15)]
+        top: usize,
+        #[arg(long, value_enum, default_value = "table")]
+        format: ProfileFormat,
+    },
     /// Join a shared fleet, or see how it is doing.
     Fleet {
         #[command(subcommand)]
@@ -278,6 +295,29 @@ fn main() -> Result<()> {
             ledger::print_savings(&records, by, &period);
             Ok(())
         }
+        Command::Profile {
+            config,
+            query,
+            job,
+            top,
+            format,
+        } => {
+            let mut records = query.load(&config)?;
+            if let Some(needle) = job.map(|j| j.to_lowercase()) {
+                records.retain(|r| {
+                    [&r.workflow, &r.job].iter().any(|f| {
+                        f.as_deref()
+                            .is_some_and(|f| f.to_lowercase().contains(&needle))
+                    })
+                });
+            }
+            let profile = profile::build(&records);
+            match format {
+                ProfileFormat::Table => profile::print(&profile, top, top),
+                ProfileFormat::Json => println!("{}", serde_json::to_string_pretty(&profile)?),
+            }
+            Ok(())
+        }
         Command::Fleet { command } => runtime()?.block_on(fleet_command(command)),
         #[cfg(feature = "ui")]
         Command::Ui { config, query } => {
@@ -349,6 +389,12 @@ enum FleetCommand {
         #[command(flatten)]
         config: ConfigArg,
     },
+}
+
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum ProfileFormat {
+    Table,
+    Json,
 }
 
 #[derive(Args)]

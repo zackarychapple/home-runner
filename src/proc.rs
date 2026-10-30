@@ -46,6 +46,8 @@ pub fn spawn_error(program: &str, err: io::Error) -> anyhow::Error {
 pub struct JobInfo {
     /// Display name from "Running job: …".
     pub name: Option<String>,
+    /// From "Listening for Jobs": the runner is registered and waiting.
+    pub listening: Option<SystemTime>,
     pub started: Option<SystemTime>,
     pub finished: Option<SystemTime>,
     /// From "Job … completed with result: …".
@@ -103,6 +105,12 @@ impl Forwarder {
             info.started = Some(SystemTime::now());
             drop(info);
             self.started.send_replace(true);
+        } else if line.contains("Listening for Jobs") {
+            self.info
+                .lock()
+                .unwrap()
+                .listening
+                .get_or_insert_with(SystemTime::now);
         } else if let Some(i) = line.find(" completed with result: ") {
             let mut info = self.info.lock().unwrap();
             info.result = Some(
