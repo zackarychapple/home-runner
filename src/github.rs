@@ -47,6 +47,45 @@ pub struct Runner {
     pub busy: bool,
 }
 
+/// The settings of an org runner group that decide which repos' jobs can land on its runners.
+#[derive(Debug, Clone, Deserialize)]
+pub struct RunnerGroup {
+    pub name: String,
+    /// `all`, `private` or `selected`.
+    pub visibility: String,
+    #[serde(default)]
+    pub default: bool,
+    #[serde(default)]
+    pub allows_public_repositories: bool,
+    #[serde(default)]
+    pub restricted_to_workflows: bool,
+}
+
+impl RunnerGroup {
+    /// One line for `doctor`: which repos can use the group.
+    pub fn describe(&self) -> String {
+        let repos = match self.visibility.as_str() {
+            "selected" => "selected repos only",
+            "private" => "all private repos",
+            _ => "all repos",
+        };
+        format!(
+            "{:?}: {repos}, public repos {}{}",
+            self.name,
+            if self.allows_public_repositories {
+                "allowed"
+            } else {
+                "blocked"
+            },
+            if self.restricted_to_workflows {
+                ", restricted to specific workflows"
+            } else {
+                ""
+            },
+        )
+    }
+}
+
 pub struct JitConfig {
     pub runner_id: u64,
     pub encoded: String,
@@ -208,6 +247,20 @@ impl GitHub {
             Err(e) if api_status(&e) == Some(StatusCode::NOT_FOUND) => Ok(()),
             Err(e) => Err(e),
         }
+    }
+
+    /// The runner group a pool's runners register into, or `None` for repo-scoped runners, which
+    /// have no groups.
+    pub fn group_id(&self, pool_override: Option<u64>) -> Option<u64> {
+        match self.scope {
+            Scope::Org(_) => Some(pool_override.unwrap_or(self.runner_group_id)),
+            Scope::Repo(_) => None,
+        }
+    }
+
+    pub async fn runner_group(&self, id: u64) -> Result<RunnerGroup> {
+        let url = format!("{}/actions/runner-groups/{id}", self.scope_url());
+        Ok(self.api(Method::GET, &url, None).await?.json().await?)
     }
 
     /// Whether a repository is private. Needs only the metadata permission every app has.
@@ -411,6 +464,7 @@ fn read_token(file: Option<&Path>, env: Option<&str>) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testutil::MockGitHub;
 
     /// Set HOME_RUNNER_TEST_KEY to a PEM file to print a JWT for verification with openssl.
     #[test]
@@ -422,5 +476,92 @@ mod tests {
         let jwt = app_jwt(42, &key).unwrap();
         assert_eq!(jwt.split('.').count(), 3);
         std::fs::write(std::env::temp_dir().join("home-runner-test.jwt"), jwt).unwrap();
+    }
+
+    #[tokio::test]
+    async fn registers_lists_and_deletes_runners() {
+        let mock = MockGitHub::start().await;
+        let gh = mock.client();
+        let labels = vec!["self-hosted".to_string(), "Linux".to_string()];
+        let jit = gh
+            .generate_jitconfig("hr-a-0-x", &labels, Some(7))
+            .await
+            .unwrap();
+        assert_eq!(jit.encoded, format!("jit-{}", jit.runner_id));
+        {
+            let state = mock.state.lock().unwrap();
+            let req = &state.jit_requests[0];
+            assert_eq!(
+                req["runner_group_id"], 7,
+                "a pool's group overrides the default"
+            );
+            assert_eq!(req["work_folder"], "_work");
+        }
+        let runners = gh.list_runners().await.unwrap();
+        assert_eq!(runners.len(), 1);
+        assert_eq!(runners[0].name, "hr-a-0-x");
+        assert!(!runners[0].busy);
+
+        gh.delete_runner(jit.runner_id).await.unwrap();
+        // Deleting what's already gone is fine; reconcile races with the slots' own cleanup.
+        gh.delete_runner(jit.runner_id).await.unwrap();
+        assert!(gh.list_runners().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn lists_more_than_one_page_of_runners() {
+        let mock = MockGitHub::start().await;
+        for i in 0..205 {
+            mock.add_runner(&format!("r{i}"), false);
+        }
+        assert_eq!(mock.client().list_runners().await.unwrap().len(), 205);
+        // Exactly one full page must still terminate.
+        let mock = MockGitHub::start().await;
+        for i in 0..100 {
+            mock.add_runner(&format!("r{i}"), false);
+        }
+        assert_eq!(mock.client().list_runners().await.unwrap().len(), 100);
+    }
+
+    #[tokio::test]
+    async fn api_errors_carry_githubs_message() {
+        let mock = MockGitHub::start().await;
+        mock.state.lock().unwrap().fail_jit = 1;
+        let err = mock
+            .client()
+            .generate_jitconfig("n", &[], None)
+            .await
+            .err()
+            .expect("the mock was told to fail");
+        assert_eq!(api_status(&err), Some(StatusCode::INTERNAL_SERVER_ERROR));
+        assert_eq!(
+            format!("{err}"),
+            "GitHub API returned 500 Internal Server Error: Server Error"
+        );
+    }
+
+    #[tokio::test]
+    async fn reads_runner_groups() {
+        let mock = MockGitHub::start().await;
+        mock.state.lock().unwrap().groups.insert(
+            7,
+            serde_json::json!({
+                "id": 7, "name": "trusted", "visibility": "selected", "default": false,
+                "allows_public_repositories": false, "restricted_to_workflows": true,
+                "selected_workflows": ["o/r/.github/workflows/release.yml@refs/heads/main"],
+                "runners_url": "ignored"
+            }),
+        );
+        let gh = mock.client();
+        let group = gh.runner_group(7).await.unwrap();
+        assert_eq!(group.name, "trusted");
+        assert!(group.restricted_to_workflows && !group.allows_public_repositories);
+        assert_eq!(
+            api_status(&gh.runner_group(8).await.unwrap_err()),
+            Some(StatusCode::NOT_FOUND)
+        );
+        // Org runners go to the default group (1) unless the pool says otherwise.
+        assert_eq!(gh.group_id(None), Some(1));
+        assert_eq!(gh.group_id(Some(7)), Some(7));
     }
 }

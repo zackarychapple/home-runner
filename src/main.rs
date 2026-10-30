@@ -4,6 +4,7 @@ mod config;
 mod daemon;
 mod doctor;
 mod github;
+mod health;
 mod hooks;
 mod init;
 mod ledger;
@@ -13,7 +14,10 @@ mod power;
 mod pricing;
 mod proc;
 mod runner_dist;
+mod selftest;
 mod service;
+#[cfg(test)]
+mod testutil;
 mod timefmt;
 #[cfg(feature = "ui")]
 mod ui;
@@ -61,18 +65,53 @@ enum Command {
         #[arg(long)]
         force: bool,
     },
-    /// Check GitHub access and that every pool's backend is ready.
+    /// Check GitHub access, that every pool's backend is ready, and how isolated each pool is.
     Doctor {
         #[command(flatten)]
         config: ConfigArg,
+        /// Exit non-zero on warnings too (open runner groups, readable credentials, …).
+        #[arg(long)]
+        strict: bool,
+    },
+    /// Start a runner of each pool, wait for GitHub to see it online, then tear it down and check
+    /// nothing was left behind. Stop the service first.
+    Selftest {
+        #[command(flatten)]
+        config: ConfigArg,
+        /// Only test this pool.
+        #[arg(long)]
+        pool: Option<String>,
+        /// How long to wait for a runner to come online.
+        #[arg(long, default_value = "5m")]
+        timeout: String,
     },
     /// Run the supervisor in the foreground.
     Run {
         #[command(flatten)]
         config: ConfigArg,
     },
-    /// Show this machine's runners as GitHub sees them.
+    /// Show what the supervisor is doing and this machine's runners as GitHub sees them.
     Status {
+        #[command(flatten)]
+        config: ConfigArg,
+        /// Machine-readable output.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Stop taking jobs: idle runners are removed, running jobs finish. For upgrades and
+    /// maintenance; `resume` undoes it.
+    Drain {
+        #[command(flatten)]
+        config: ConfigArg,
+        /// Wait until no job is running.
+        #[arg(long)]
+        wait: bool,
+        /// With --wait, give up after this long.
+        #[arg(long, default_value = "6h", requires = "wait")]
+        timeout: String,
+    },
+    /// Take jobs again after `drain`.
+    Resume {
         #[command(flatten)]
         config: ConfigArg,
     },
@@ -141,9 +180,35 @@ enum Command {
 fn main() -> Result<()> {
     match Cli::parse().command {
         Command::Init { config, force } => init::write(&config.path(), force),
-        Command::Doctor { config } => runtime()?.block_on(doctor::run(&config.path())),
+        Command::Doctor { config, strict } => {
+            runtime()?.block_on(doctor::run(&config.path(), strict))
+        }
+        Command::Selftest {
+            config,
+            pool,
+            timeout,
+        } => {
+            // The runner's console output would bury the step results; HOME_RUNNER_LOG=info shows it.
+            let _log = logging::init_with_default(None, "warn");
+            let timeout = timefmt::parse_since(&timeout)?
+                .ok_or_else(|| anyhow::anyhow!("--timeout must be a duration like 5m"))?;
+            runtime()?.block_on(selftest::run(&config.path(), pool.as_deref(), timeout))
+        }
         Command::Run { config } => run_foreground(&config.path()),
-        Command::Status { config } => runtime()?.block_on(daemon::status(&config.path())),
+        Command::Status { config, json } => {
+            runtime()?.block_on(daemon::status(&config.path(), json))
+        }
+        Command::Drain {
+            config,
+            wait,
+            timeout,
+        } => {
+            let config = config::Config::load(&config.path())?;
+            let timeout = timefmt::parse_since(&timeout)?
+                .ok_or_else(|| anyhow::anyhow!("--timeout must be a duration like 6h"))?;
+            runtime()?.block_on(health::drain(&config, wait.then_some(timeout)))
+        }
+        Command::Resume { config } => health::resume(&config::Config::load(&config.path())?),
         Command::Cleanup { config } => {
             let _log = logging::init(None);
             runtime()?.block_on(daemon::cleanup(&config.path()))

@@ -6,6 +6,8 @@
 # - pnpm installed globally (pnpm switches itself to a repo's `packageManager` version if needed).
 # - Rust through rustup with a pinned toolchain preinstalled, plus sccache.
 # - A C toolchain, gh, and passwordless sudo (from the base image) for `sudo apt-get` steps.
+# - Docker Engine, compose and buildx, for pools with `docker_in_job = true` (the wrapper starts
+#   dockerd for each job; nothing runs it otherwise). Skip with --build-arg INSTALL_DOCKER=false.
 #
 # Package stores and build caches point at /cache. With `cache_size` on the pool that is a
 # persistent volume per slot, so the second job onwards starts warm; without it, /cache is just a
@@ -19,6 +21,7 @@ ARG PNPM_VERSION=10.33.1
 ARG RUST_TOOLCHAIN=1.99.0
 ARG RUST_COMPONENTS="clippy rustfmt"
 ARG SCCACHE_VERSION=0.19.0
+ARG INSTALL_DOCKER=true
 # Extra apt packages workflows would otherwise install on every run.
 ARG APT_PACKAGES="libasound2-dev"
 
@@ -38,6 +41,12 @@ RUN set -eux; \
     echo "deb [signed-by=/etc/apt/keyrings/githubcli.gpg] https://cli.github.com/packages stable main" > /etc/apt/sources.list.d/github-cli.list; \
     apt-get update; \
     apt-get install -y --no-install-recommends gh; \
+    if [ "$INSTALL_DOCKER" = true ]; then \
+      curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc; \
+      echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu noble stable" > /etc/apt/sources.list.d/docker.list; \
+      apt-get update; \
+      apt-get install -y --no-install-recommends iptables docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin; \
+    fi; \
     rm -rf /var/lib/apt/lists/*; \
     case "$(dpkg --print-architecture)" in \
       amd64) node_arch=x64; rust_arch=x86_64 ;; \
