@@ -8,7 +8,7 @@ use anyhow::{Context, Result, ensure};
 use tokio::process::Command;
 use tracing::debug;
 
-use super::{Running, arch_label, os_label};
+use super::{ProbeOutput, Running, arch_label, os_label, probe_output};
 use crate::hooks;
 use crate::proc::{self, pipe_output};
 use crate::runner_dist::{RunnerDist, host_os_arch};
@@ -84,6 +84,28 @@ impl HostBackend {
             Ok(text) => hooks::parse_env(&text),
             Err(_) => HashMap::new(),
         }
+    }
+
+    /// Runs the probe directly on this machine, as the user the service runs as.
+    #[cfg(unix)]
+    pub async fn probe(&self, script: &str, timeout: Duration) -> Result<ProbeOutput> {
+        let child = Command::new("sh")
+            .args(["-c", script])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .context("starting sh for the probe")?;
+        match tokio::time::timeout(timeout, child.wait_with_output()).await {
+            Ok(out) => Ok(probe_output(out?)),
+            Err(_) => anyhow::bail!("the probe did not finish within {}s", timeout.as_secs()),
+        }
+    }
+
+    #[cfg(not(unix))]
+    pub async fn probe(&self, _script: &str, _timeout: Duration) -> Result<ProbeOutput> {
+        anyhow::bail!("prerequisite probes need a POSIX shell, which Windows host pools don't have")
     }
 
     pub async fn cleanup(&self, name: &str) -> Result<()> {

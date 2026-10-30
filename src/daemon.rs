@@ -17,6 +17,7 @@ use crate::config::{Config, PoolConfig};
 use crate::github::GitHub;
 use crate::health::{self, FleetStatus, Health, Notifier, Phase, Slots};
 use crate::live::{self, Live};
+use crate::prereq::{self, Provision};
 use crate::runner_dist::RunnerDist;
 use crate::{fleet, hooks, power, timefmt};
 
@@ -51,6 +52,13 @@ pub struct Pool {
     pub pricing: PoolPricing,
     pub(crate) hook_env: Vec<(String, String)>,
     pub(crate) ready: OnceCell<()>,
+    /// The pool's job prerequisites, if it declares a profile.
+    pub prereq: Option<Provision>,
+    /// The backend for the pool's own image, when jobs run in a derived one. Used to build it.
+    pub base_backend: Option<Backend>,
+    /// What the pool was last verified against (see `prereq::run::readiness_key`). Held while
+    /// probing, so slots wait for one probe instead of each starting their own.
+    pub(crate) verified: tokio::sync::Mutex<Option<String>>,
 }
 
 impl Pool {
@@ -141,6 +149,7 @@ impl Drop for Claim<'_> {
     }
 }
 
+#[derive(Debug)]
 enum Outcome {
     Completed,
     Shutdown,
@@ -170,20 +179,52 @@ pub fn build(config: &Config) -> Result<Built> {
         .iter()
         .map(|cfg| {
             let backend = Backend::new(&cfg.backend, &data_dir, dist.clone());
-            let labels = labels(&backend, cfg);
             let platform = backend.platform_labels();
+            let prereq = match &cfg.profile {
+                Some(name) => {
+                    let profile = config
+                        .profiles
+                        .iter()
+                        .find(|p| &p.name == name)
+                        .with_context(|| format!("pool {:?}: no profile {name:?}", cfg.name))?;
+                    Some(Provision::new(
+                        profile,
+                        cfg,
+                        &platform[0],
+                        &platform[1],
+                        data_dir.join("prereq"),
+                    )?)
+                }
+                None => None,
+            };
+            // Jobs run in the derived image when there is one; the pool's own image is the base.
+            let (backend, base_backend) = match &prereq {
+                Some(p) if p.derived_image.is_some() => (
+                    Backend::new(&p.effective_pool(cfg).backend, &data_dir, dist.clone()),
+                    Some(backend),
+                ),
+                _ => (backend, None),
+            };
+            let labels = labels(&backend, cfg);
             let pricing = PoolPricing::new(cfg, &platform[0], &platform[1], backend.cpus());
-            Arc::new(Pool {
+            let mut hook_env = accounting.hook_env(&pricing);
+            if let Some(p) = &prereq {
+                hook_env.extend(p.job_env());
+            }
+            Ok(Arc::new(Pool {
                 prefix: format!("{host_prefix}{}-", cfg.name),
-                hook_env: accounting.hook_env(&pricing),
+                hook_env,
                 cfg: cfg.clone(),
                 backend,
                 labels,
                 pricing,
                 ready: OnceCell::new(),
-            })
+                prereq,
+                base_backend,
+                verified: Default::default(),
+            }))
         })
-        .collect();
+        .collect::<Result<Vec<_>>>()?;
     Ok(Built {
         gh,
         accounting,
@@ -491,6 +532,11 @@ async fn run_once(
         r = pool.ready() => r.with_context(|| format!("preparing the {} backend", pool.cfg.backend.kind()))?,
         _ = shutdown.cancelled() => return Ok(Outcome::Shutdown),
     }
+    // A pool whose worker doesn't meet its profile takes no jobs: nothing is registered, so GitHub
+    // never hands it work it would fail.
+    if !ensure_prereqs(ctx, pool, shutdown).await? {
+        return Ok(Outcome::Shutdown);
+    }
     let name = format!("{}{slot}-{}", pool.prefix, short_id());
     let _claim = Claim::new(&ctx.active, &name);
     // Cancelled when someone asks to stop this runner's job (see `live::request_stop`).
@@ -526,6 +572,72 @@ async fn run_runner(
         warn!(runner = %name, "deregistering failed, reconcile will retry: {e:#}");
     }
     result
+}
+
+/// Makes sure the pool's worker meets its profile before a runner is registered, installing or
+/// repairing first when the profile allows it. `Ok(false)` means shutdown was requested.
+///
+/// The probe worker is claimed while it runs, so reconcile leaves it alone, and it is always
+/// removed afterwards, whether the probe passed, failed or was cancelled.
+pub(crate) async fn ensure_prereqs(
+    ctx: &Ctx,
+    pool: &Pool,
+    shutdown: &CancellationToken,
+) -> Result<bool> {
+    let Some(prov) = &pool.prereq else {
+        return Ok(true);
+    };
+    let mut verified = tokio::select! {
+        guard = pool.verified.lock() => guard,
+        _ = shutdown.cancelled() => return Ok(false),
+    };
+    let key = prereq::run::readiness_key(&pool.backend, prov).await;
+    if verified.as_deref() == Some(key.as_str()) {
+        return Ok(true);
+    }
+    let name = format!("{}probe-{}", pool.prefix, short_id());
+    let _claim = Claim::new(&ctx.active, &name);
+    let probe = async {
+        let mut report = prereq::run::verify(
+            &pool.backend,
+            pool.base_backend.as_ref(),
+            prov,
+            &pool.cfg.name,
+            &name,
+        )
+        .await;
+        let _ = pool.backend.cleanup(&name).await;
+        if !report.ready() && prov.profile.auto_install && prov.can_install() {
+            info!(pool = %pool.cfg.name, "prerequisites are not met; installing them (auto_install)");
+            match prereq::run::install(pool, prov, false).await {
+                Ok(message) => info!(pool = %pool.cfg.name, "{message}"),
+                Err(e) => warn!(pool = %pool.cfg.name, "installing prerequisites failed: {e:#}"),
+            }
+            report = prereq::run::verify(
+                &pool.backend,
+                pool.base_backend.as_ref(),
+                prov,
+                &pool.cfg.name,
+                &name,
+            )
+            .await;
+            let _ = pool.backend.cleanup(&name).await;
+        }
+        report
+    };
+    let report = tokio::select! {
+        report = probe => report,
+        _ = shutdown.cancelled() => {
+            let _ = pool.backend.cleanup(&name).await;
+            return Ok(false);
+        }
+    };
+    if !report.ready() {
+        return Err(anyhow!(report.failure()));
+    }
+    info!(pool = %pool.cfg.name, profile = %prov.profile.name, "prerequisites verified");
+    *verified = Some(prereq::run::readiness_key(&pool.backend, prov).await);
+    Ok(true)
 }
 
 async fn drive(
@@ -1127,5 +1239,156 @@ mod tests {
         assert_eq!(records[0].result, "Interrupted");
         assert!(h.mock.names().is_empty());
         assert!(h.resources().is_empty());
+    }
+
+    // Prerequisite gating -------------------------------------------------------------------
+
+    const GIT_PROFILE: &str =
+        "name = \"p\"\n[[require]]\nkind = \"command\"\nname = \"git\"\nversion = \"2\"";
+    const IDENTITY: &str = "HRP\tidentity\tok\tuser=runner uid=1001 os=Linux arch=aarch64\n";
+
+    /// A harness whose pool requires `GIT_PROFILE`, and whose probes print `probe_stdout`.
+    async fn gated(script: &str, probe_stdout: &str) -> Harness {
+        let mut h = Harness::new(script).await;
+        let pool = Arc::get_mut(&mut h.pool).unwrap();
+        pool.prereq = Some(
+            Provision::new(
+                &crate::prereq::tests::profile(GIT_PROFILE),
+                &pool.cfg,
+                "Linux",
+                "ARM64",
+                std::env::temp_dir(),
+            )
+            .unwrap(),
+        );
+        h.fake.lock().unwrap().probe_output = crate::backend::ProbeOutput {
+            stdout: format!("{IDENTITY}{probe_stdout}"),
+            stderr: String::new(),
+            code: Some(0),
+        };
+        h
+    }
+
+    const GIT_OK: &str = "HRP\tcommand:git\tok\tgit version 2.47.0\n";
+
+    #[tokio::test]
+    async fn a_pool_that_fails_its_profile_registers_nothing() {
+        let h = gated(ONE_JOB, "HRP\tcommand:git\tmissing\tnot found on PATH\n").await;
+        let err = run_once(&h.ctx, &h.pool, 0, &CancellationToken::new())
+            .await
+            .expect_err("an unready pool must not run");
+        let text = format!("{err:#}");
+        assert!(text.contains("pool t is not ready"), "{text}");
+        assert!(text.contains("command:git missing"), "{text}");
+        assert!(
+            text.contains("fix:"),
+            "the operator is told what to do: {text}"
+        );
+        // No runner was registered, so GitHub can't hand this pool a job.
+        assert_eq!(h.mock.jit_requests(), 0);
+        assert!(h.mock.names().is_empty());
+        // The probe worker was owned while it ran, then removed.
+        let fake = h.fake.lock().unwrap();
+        assert_eq!(fake.probed.len(), 1);
+        assert!(
+            fake.probed[0].starts_with("hr-test-t-probe-"),
+            "{:?}",
+            fake.probed
+        );
+        assert_eq!(fake.cleaned, fake.probed);
+        assert!(fake.resources.is_empty());
+        drop(fake);
+        assert!(h.ctx.active.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_ready_pool_is_verified_once_and_then_runs_jobs() {
+        let h = gated(ONE_JOB, GIT_OK).await;
+        for _ in 0..2 {
+            let outcome = run_once(&h.ctx, &h.pool, 0, &CancellationToken::new())
+                .await
+                .unwrap();
+            assert!(matches!(outcome, Outcome::Completed));
+        }
+        assert_eq!(h.mock.state.lock().unwrap().jit_requests.len(), 2);
+        assert_eq!(
+            h.fake.lock().unwrap().probed.len(),
+            1,
+            "not re-probed for every job"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_wrong_version_keeps_the_pool_unready_until_it_is_fixed() {
+        let h = gated(ONE_JOB, "HRP\tcommand:git\tok\tgit version 1.9.0\n").await;
+        let err = run_once(&h.ctx, &h.pool, 0, &CancellationToken::new())
+            .await
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("command:git wrong version"));
+        assert!(format!("{err:#}").contains("found 1.9.0, need 2"));
+        assert_eq!(h.mock.jit_requests(), 0);
+
+        // The operator fixes the worker; the next attempt verifies again and the pool starts.
+        h.fake.lock().unwrap().probe_output.stdout = format!("{IDENTITY}{GIT_OK}");
+        let outcome = run_once(&h.ctx, &h.pool, 0, &CancellationToken::new())
+            .await
+            .unwrap();
+        assert!(matches!(outcome, Outcome::Completed));
+        assert_eq!(h.fake.lock().unwrap().probed.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_probe_that_cannot_run_is_not_ready_and_recovers() {
+        let h = gated(ONE_JOB, GIT_OK).await;
+        h.fake.lock().unwrap().probe_failures = 1;
+        let err = run_once(&h.ctx, &h.pool, 0, &CancellationToken::new())
+            .await
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("could not run the probe in a worker"));
+        assert_eq!(h.mock.jit_requests(), 0);
+        assert!(
+            h.fake.lock().unwrap().resources.is_empty(),
+            "the failed probe's worker is removed"
+        );
+        assert!(matches!(
+            run_once(&h.ctx, &h.pool, 0, &CancellationToken::new())
+                .await
+                .unwrap(),
+            Outcome::Completed
+        ));
+    }
+
+    #[tokio::test]
+    async fn an_unready_slot_backs_off_and_shows_why_without_ever_registering() {
+        let h = gated(IDLE, "HRP\tcommand:git\tmissing\tnot found on PATH\n").await;
+        let (shutdown, task) = start_slot(&h);
+        eventually("repeated failures", || {
+            h.ctx.slots.snapshot()[0].consecutive_failures >= 3
+        })
+        .await;
+        let slot = &h.ctx.slots.snapshot()[0];
+        assert!(
+            slot.last_error
+                .as_deref()
+                .unwrap()
+                .starts_with("pool t is not ready")
+        );
+        assert!(!slot.is_healthy());
+        assert_eq!(h.mock.jit_requests(), 0);
+        stop(shutdown, task).await;
+        assert!(h.fake.lock().unwrap().resources.is_empty());
+    }
+
+    #[tokio::test]
+    async fn installing_is_refused_where_the_app_cannot_do_it() {
+        let h = gated(IDLE, GIT_OK).await;
+        let prov = h.pool.prereq.as_ref().unwrap();
+        assert!(!prov.can_install());
+        let err = crate::prereq::run::install(&h.pool, prov, false)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("doesn't install for host pools"), "{err}");
+        assert!(err.contains("prereq inspect --pool t"), "{err}");
     }
 }

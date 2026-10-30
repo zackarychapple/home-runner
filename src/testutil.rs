@@ -294,6 +294,9 @@ impl Harness {
             cfg,
             backend,
             ready: Default::default(),
+            prereq: None,
+            base_backend: None,
+            verified: Default::default(),
         });
         Self {
             mock,

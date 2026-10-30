@@ -12,6 +12,7 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use anyhow::{Result, bail};
+use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
 use crate::config::Config;
@@ -111,6 +112,17 @@ pub async fn check_pool(ctx: &Ctx, pool: &Pool, timeout: Duration, poll: Duratio
 
     'run: {
         if step!("backend ready", pool.ready()).is_none() {
+            break 'run;
+        }
+        if pool.prereq.is_some()
+            && step!("prerequisites verified", async {
+                match daemon::ensure_prereqs(ctx, pool, &CancellationToken::new()).await? {
+                    true => Ok(()),
+                    false => bail!("interrupted"),
+                }
+            })
+            .is_none()
+        {
             break 'run;
         }
         registered = step!("registered with GitHub", async {
