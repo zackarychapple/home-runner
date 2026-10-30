@@ -1,11 +1,12 @@
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::path::Path;
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow};
-use tokio::sync::{Notify, OnceCell};
+use tokio::sync::{Notify, OnceCell, watch};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
@@ -14,14 +15,32 @@ use crate::accounting::{Accounting, PoolPricing};
 use crate::backend::Backend;
 use crate::config::{Config, PoolConfig};
 use crate::github::GitHub;
+use crate::health::{self, FleetStatus, Health, Notifier, Phase, Slots};
+use crate::live::{self, Live};
 use crate::runner_dist::RunnerDist;
-use crate::state::{self, Board, Phase, Slot};
 use crate::{fleet, hooks, power, timefmt};
 
-const MIN_BACKOFF: Duration = Duration::from_secs(5);
-const MAX_BACKOFF: Duration = Duration::from_secs(300);
-/// A runner that exits this fast without taking a job is broken, not finished.
-const QUICK_EXIT: Duration = Duration::from_secs(120);
+/// How the slot loops pace themselves. Tests shrink these.
+#[derive(Clone, Copy)]
+pub struct Timing {
+    pub min_backoff: Duration,
+    pub max_backoff: Duration,
+    /// A runner that exits this fast without taking a job is broken, not finished.
+    pub quick_exit: Duration,
+}
+
+impl Default for Timing {
+    fn default() -> Self {
+        Self {
+            min_backoff: Duration::from_secs(5),
+            max_backoff: Duration::from_secs(300),
+            quick_exit: Duration::from_secs(120),
+        }
+    }
+}
+
+/// How often the supervisor rewrites `state.json`, checks the drain flag and evaluates alerts.
+const HEALTH_TICK: Duration = Duration::from_secs(5);
 
 pub struct Pool {
     pub cfg: PoolConfig,
@@ -30,13 +49,13 @@ pub struct Pool {
     /// Every runner/VM/container in this pool is named `<prefix><slot>-<id>`.
     pub prefix: String,
     pub pricing: PoolPricing,
-    hook_env: Vec<(String, String)>,
-    ready: OnceCell<()>,
+    pub(crate) hook_env: Vec<(String, String)>,
+    pub(crate) ready: OnceCell<()>,
 }
 
 impl Pool {
     /// Runs `prepare` once; a failure is retried on the next call.
-    async fn ready(&self) -> Result<()> {
+    pub(crate) async fn ready(&self) -> Result<()> {
         self.ready
             .get_or_try_init(|| self.backend.prepare())
             .await
@@ -44,15 +63,60 @@ impl Pool {
     }
 }
 
-struct Ctx {
-    gh: Arc<GitHub>,
+pub struct Ctx {
+    pub gh: Arc<GitHub>,
     accounting: Arc<Accounting>,
     host_prefix: String,
     /// Names of runners a slot is currently responsible for. Reconcile never touches these.
     active: Mutex<HashSet<String>>,
-    board: Arc<Board>,
+    pub slots: Slots,
+    /// `true` while draining: slots deregister idle runners and don't start new ones.
+    pub drain: watch::Sender<bool>,
+    /// Unix time GitHub last answered an API call.
+    github_ok_at: AtomicI64,
+    pub timing: Timing,
+    /// Each slot's current runner and job.
+    pub live: Live,
     /// Signalled after each job is written to the ledger, so the fleet hears about it soon.
-    job_done: Arc<Notify>,
+    pub job_done: Arc<Notify>,
+    fleet: Mutex<Option<FleetStatus>>,
+    /// The state most recently written to `state.json`.
+    latest: Mutex<Option<health::State>>,
+}
+
+impl Ctx {
+    pub fn new(gh: Arc<GitHub>, accounting: Arc<Accounting>, host_prefix: String) -> Self {
+        Self {
+            gh,
+            accounting,
+            host_prefix,
+            active: Mutex::default(),
+            slots: Slots::default(),
+            drain: watch::channel(false).0,
+            github_ok_at: AtomicI64::new(timefmt::now()),
+            timing: Timing::default(),
+            live: Live::default(),
+            job_done: Arc::new(Notify::new()),
+            fleet: Mutex::default(),
+            latest: Mutex::default(),
+        }
+    }
+
+    fn github_ok(&self) {
+        self.github_ok_at.store(timefmt::now(), Ordering::Relaxed);
+    }
+
+    pub fn latest_state(&self) -> Option<health::State> {
+        self.latest.lock().unwrap().clone()
+    }
+
+    pub fn update_fleet_status(&self, f: impl FnOnce(&mut FleetStatus)) {
+        f(self
+            .fleet
+            .lock()
+            .unwrap()
+            .get_or_insert_with(Default::default));
+    }
 }
 
 /// Marks a runner name as owned by a slot for as long as the claim lives.
@@ -80,6 +144,8 @@ impl Drop for Claim<'_> {
 enum Outcome {
     Completed,
     Shutdown,
+    /// The runner was idle when a drain began and was removed.
+    Drained,
 }
 
 pub struct Built {
@@ -139,7 +205,7 @@ fn labels(backend: &Backend, pool: &PoolConfig) -> Vec<String> {
 }
 
 /// Prevents two supervisors (say, the service and a manual `run`) from fighting over the same runners.
-fn lock_instance(config: &Config) -> Result<File> {
+pub fn lock_instance(config: &Config) -> Result<File> {
     let dir = config.data_dir();
     std::fs::create_dir_all(&dir)?;
     let path = dir.join("home-runner.lock");
@@ -161,21 +227,9 @@ pub async fn run(config: Config, shutdown: CancellationToken) -> Result<()> {
         accounting,
         pools,
     } = build(&config)?;
-    let mut board = Board::new(&config.data_dir(), base_state(&config, &gh, &pools));
-    for (p, pool) in pools.iter().enumerate() {
-        for slot in 0..pool.cfg.count {
-            board.slots.push(Slot::new(p, slot));
-        }
-    }
-    let board = Arc::new(board);
-    let ctx = Arc::new(Ctx {
-        gh,
-        accounting,
-        host_prefix: config.runner_prefix(),
-        active: Mutex::default(),
-        board: board.clone(),
-        job_done: Arc::new(Notify::new()),
-    });
+    let ctx = Arc::new(Ctx::new(gh, accounting, config.runner_prefix()));
+    let data_dir = config.data_dir();
+    ctx.drain.send_replace(health::drain_requested(&data_dir));
     info!(
         host = %config.host_name(),
         scope = %ctx.gh.scope_label(),
@@ -199,18 +253,22 @@ pub async fn run(config: Config, shutdown: CancellationToken) -> Result<()> {
     }
 
     let mut slots = JoinSet::new();
-    for slot in &board.slots {
-        let pool = pools[slot.pool].clone();
-        slots.spawn(slot_loop(ctx.clone(), pool, slot.clone(), shutdown.clone()));
+    for pool in &pools {
+        for slot in 0..pool.cfg.count {
+            ctx.slots.register(&pool.cfg.name, slot);
+            slots.spawn(slot_loop(ctx.clone(), pool.clone(), slot, shutdown.clone()));
+        }
     }
 
-    let publisher = {
-        let (board, pools, stop) = (board.clone(), pools.clone(), CancellationToken::new());
-        let task = tokio::spawn(publish(board, pools, stop.clone()));
-        (task, stop)
-    };
+    let monitor = tokio::spawn(monitor(
+        ctx.clone(),
+        config.clone(),
+        pools.clone(),
+        data_dir.clone(),
+        shutdown.clone(),
+    ));
 
-    let reporter = match fleet::Reporter::new(&config, board.clone()) {
+    let reporter = match fleet::Reporter::new(&config, ctx.clone()) {
         Ok(Some(reporter)) => Some(tokio::spawn(
             reporter.run(ctx.job_done.clone(), shutdown.clone()),
         )),
@@ -247,62 +305,70 @@ pub async fn run(config: Config, shutdown: CancellationToken) -> Result<()> {
         warn!("some runners did not stop within 90s; the next start will clean them up");
     }
     reconciler.abort();
+    monitor.abort();
     if let Some(reporter) = reporter {
         let _ = tokio::time::timeout(Duration::from_secs(15), reporter).await;
     }
-    publisher.1.cancel();
-    let _ = publisher.0.await;
+    health::remove_state(&data_dir);
     info!("stopped");
     Ok(())
 }
 
-/// The parts of the published state that don't change while running.
-fn base_state(config: &Config, gh: &GitHub, pools: &[Arc<Pool>]) -> state::State {
+/// Once per tick: pick up drain and stop requests, publish `state.json`, and send alerts.
+async fn monitor(
+    ctx: Arc<Ctx>,
+    config: Config,
+    pools: Vec<Arc<Pool>>,
+    data_dir: std::path::PathBuf,
+    shutdown: CancellationToken,
+) {
     let rate = |id: &str, list: f64| config.pricing.rates.get(id).copied().unwrap_or(list);
-    state::State {
-        host: config.host_name(),
-        version: env!("CARGO_PKG_VERSION").into(),
-        pid: std::process::id(),
-        started_at: timefmt::now(),
-        updated_at: timefmt::now(),
-        running: true,
-        scope: gh.scope_label(),
-        electricity_usd_per_kwh: config.pricing.electricity_usd_per_kwh,
-        job_watts: config.pricing.job_watts,
-        pools: pools
-            .iter()
-            .map(|p| state::PoolState {
-                name: p.cfg.name.clone(),
-                backend: p.cfg.backend.kind().into(),
-                labels: p.labels.clone(),
-                os: p.pricing.os.clone(),
-                arch: p.pricing.arch.clone(),
-                cpus: p.pricing.cpus,
-                github_label: p.pricing.github.map(|s| s.label.to_string()),
-                github_usd_per_minute: p.pricing.github.map(|s| rate(s.id, s.usd_per_minute)),
-                slots: vec![],
-            })
-            .collect(),
-        reconcile: None,
-        fleet: None,
-    }
-}
-
-/// Rewrites `state.json` every couple of seconds and acts on the GUI's stop requests.
-async fn publish(board: Arc<Board>, pools: Vec<Arc<Pool>>, stop: CancellationToken) {
+    let pool_info: Vec<health::PoolState> = pools
+        .iter()
+        .map(|p| health::PoolState {
+            name: p.cfg.name.clone(),
+            backend: p.cfg.backend.kind().into(),
+            labels: p.labels.clone(),
+            os: p.pricing.os.clone(),
+            arch: p.pricing.arch.clone(),
+            cpus: p.pricing.cpus,
+            github_label: p.pricing.github.map(|s| s.label.to_string()),
+            github_usd_per_minute: p.pricing.github.map(|s| rate(s.id, s.usd_per_minute)),
+            slots: vec![],
+        })
+        .collect();
     let mut last_ticks = hooks::cpu_ticks();
-    let mut warned = false;
-    loop {
-        board.take_stop_requests();
-        // Host-backend jobs keep their metadata on disk and share this machine's CPU.
-        let mut extra = HashMap::new();
-        for runner in board.busy_runners() {
-            if let Some(pool) = pools.iter().find(|p| runner.starts_with(&p.prefix))
-                && matches!(pool.backend, Backend::Host(_))
-            {
-                extra.insert(runner.clone(), pool.backend.collect(&runner).await);
-            }
+    let host = config.host_name();
+    let started_at = timefmt::now();
+    let mut health = Health::new(&host, &config.alerts);
+    let notifier = match Notifier::new(&host, &config.alerts) {
+        Ok(n) => n,
+        Err(e) => {
+            warn!("alerts disabled: {e:#}");
+            None
         }
+    };
+    let mut ticker = tokio::time::interval(HEALTH_TICK);
+    loop {
+        tokio::select! {
+            _ = ticker.tick() => {}
+            _ = shutdown.cancelled() => return,
+        }
+        let draining = health::drain_requested(&data_dir);
+        if ctx.drain.send_replace(draining) != draining {
+            info!(
+                "{}",
+                if draining {
+                    "draining: no new jobs will start"
+                } else {
+                    "resumed"
+                }
+            );
+        }
+
+        ctx.live.take_stop_requests(&data_dir);
+
+        let now = timefmt::now();
         let ticks = hooks::cpu_ticks();
         let host_cpu = match (last_ticks, ticks) {
             (Some((b0, t0)), Some((b1, t1))) if t1 > t0 => {
@@ -311,93 +377,149 @@ async fn publish(board: Arc<Board>, pools: Vec<Arc<Pool>>, stop: CancellationTok
             _ => None,
         };
         last_ticks = ticks;
-
-        let mut current = board.collect(&extra, host_cpu);
-        let stopping = stop.is_cancelled();
-        if stopping {
-            current.running = false;
-            for slot in current.pools.iter_mut().flat_map(|p| p.slots.iter_mut()) {
-                slot.phase = Phase::Stopped;
-                slot.job = None;
+        let mut slots = ctx.slots.snapshot();
+        for s in &mut slots {
+            let Some(pool) = pools.iter().find(|p| p.cfg.name == s.pool) else {
+                continue;
+            };
+            let Some((runner, info)) = ctx.live.job(&s.pool, s.slot) else {
+                continue;
+            };
+            if let Some(mut info) = info {
+                // Host-backend jobs keep their metadata on disk and share this machine's CPU.
+                let host = matches!(pool.backend, Backend::Host(_));
+                if host {
+                    let extra: HashMap<_, _> = pool.backend.collect(&runner).await;
+                    for (k, v) in extra {
+                        info.meta.entry(k).or_insert(v);
+                    }
+                }
+                let cpu = ctx.live.sample_cpu(
+                    &s.pool,
+                    s.slot,
+                    &info.meta,
+                    pool.pricing.cpus,
+                    host_cpu.filter(|_| host),
+                );
+                s.job = Some(live::live_job(&info, cpu));
+            }
+            s.runner = Some(runner);
+        }
+        let github_ok_at = ctx.github_ok_at.load(Ordering::Relaxed);
+        for alert in health.evaluate(now, &slots, github_ok_at) {
+            if alert.firing {
+                warn!("{}", alert.message);
+            } else {
+                info!("{}", alert.message);
+            }
+            if let Some(notifier) = &notifier
+                && let Err(e) = notifier.send(&alert).await
+            {
+                warn!("{e:#}");
             }
         }
-        match state::write(&board.path, &current) {
-            Ok(()) => warned = false,
-            Err(e) if !warned => {
-                warn!("writing {}: {e}", board.path.display());
-                warned = true;
-            }
-            Err(_) => {}
+        let state = health::State {
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            host: host.clone(),
+            pid: std::process::id(),
+            started_at,
+            updated_at: now,
+            draining,
+            github_ok_at,
+            slots,
+            alerts: health.firing(),
+            scope: ctx.gh.scope_label(),
+            electricity_usd_per_kwh: config.pricing.electricity_usd_per_kwh,
+            job_watts: config.pricing.job_watts,
+            pools: pool_info.clone(),
+            fleet: ctx.fleet.lock().unwrap().clone(),
+        };
+        if let Err(e) = health::write_state(&data_dir, &state) {
+            warn!("{e:#}");
         }
-        if stopping {
-            break;
-        }
-        tokio::select! {
-            _ = tokio::time::sleep(Duration::from_secs(state::PUBLISH_SECS)) => {}
-            _ = stop.cancelled() => {}
-        }
+        *ctx.latest.lock().unwrap() = Some(state);
     }
 }
 
-async fn slot_loop(ctx: Arc<Ctx>, pool: Arc<Pool>, status: Arc<Slot>, shutdown: CancellationToken) {
-    let slot = status.slot;
-    let mut backoff = MIN_BACKOFF;
+pub async fn slot_loop(ctx: Arc<Ctx>, pool: Arc<Pool>, slot: usize, shutdown: CancellationToken) {
+    let timing = ctx.timing;
+    let name = pool.cfg.name.as_str();
+    let mut backoff = timing.min_backoff;
+    let mut drain = ctx.drain.subscribe();
     while !shutdown.is_cancelled() {
-        let result = run_once(&ctx, &pool, &status, &shutdown).await;
-        status.end_runner();
-        match result {
-            Ok(Outcome::Completed) => {
-                backoff = MIN_BACKOFF;
-                status.ok();
+        if *drain.borrow() {
+            ctx.slots.phase(name, slot, Phase::Paused);
+            tokio::select! {
+                _ = drain.wait_for(|draining| !*draining) => {}
+                _ = shutdown.cancelled() => break,
             }
+            continue;
+        }
+        match run_once(&ctx, &pool, slot, &shutdown).await {
+            Ok(Outcome::Completed) => {
+                backoff = timing.min_backoff;
+                ctx.slots.job_done(name, slot);
+            }
+            Ok(Outcome::Drained) => backoff = timing.min_backoff,
             Ok(Outcome::Shutdown) => break,
             Err(e) => {
-                let delay = backoff + jitter();
-                status.backoff(format!("{e:#}"), timefmt::now() + delay.as_secs() as i64);
+                let delay = backoff + jitter(timing.min_backoff);
                 error!(pool = %pool.cfg.name, slot, "{e:#}; retrying in {}s", delay.as_secs());
-                backoff = (backoff * 2).min(MAX_BACKOFF);
+                ctx.slots.failed(name, slot, format!("{e:#}"));
+                ctx.slots
+                    .retry_at(name, slot, timefmt::now() + delay.as_secs() as i64);
+                backoff = (backoff * 2).min(timing.max_backoff);
                 tokio::select! {
                     _ = tokio::time::sleep(delay) => {}
+                    _ = drain.wait_for(|draining| *draining) => {}
                     _ = shutdown.cancelled() => break,
                 }
             }
         }
     }
-    status.set(Phase::Stopped);
 }
 
 /// One runner, one job: register → launch → wait → tear down → deregister.
 async fn run_once(
     ctx: &Ctx,
     pool: &Pool,
-    status: &Slot,
+    slot: usize,
     shutdown: &CancellationToken,
 ) -> Result<Outcome> {
-    let slot = status.slot;
-    if pool.ready.get().is_none() {
-        status.set(Phase::Preparing);
-    }
+    ctx.slots.phase(&pool.cfg.name, slot, Phase::Starting);
     tokio::select! {
         r = pool.ready() => r.with_context(|| format!("preparing the {} backend", pool.cfg.backend.kind()))?,
         _ = shutdown.cancelled() => return Ok(Outcome::Shutdown),
     }
     let name = format!("{}{slot}-{}", pool.prefix, short_id());
     let _claim = Claim::new(&ctx.active, &name);
-    // Cancelled when someone asks to stop this runner's job (see `state::request_stop`).
+    // Cancelled when someone asks to stop this runner's job (see `live::request_stop`).
     let stop = CancellationToken::new();
-    status.start_runner(&name, stop.clone());
-    status.set(Phase::Registering);
+    ctx.live.start(&pool.cfg.name, slot, &name, stop.clone());
+    let result = run_runner(ctx, pool, slot, &name, shutdown, &stop).await;
+    ctx.live.end(&pool.cfg.name, slot);
+    result
+}
+
+async fn run_runner(
+    ctx: &Ctx,
+    pool: &Pool,
+    slot: usize,
+    name: &str,
+    shutdown: &CancellationToken,
+    stop: &CancellationToken,
+) -> Result<Outcome> {
     let jit = ctx
         .gh
-        .generate_jitconfig(&name, &pool.labels)
+        .generate_jitconfig(name, &pool.labels, pool.cfg.runner_group_id)
         .await
         .context("registering runner with GitHub")?;
+    ctx.github_ok();
     info!(runner = %name, "registered, waiting for a job");
 
-    let result = drive(ctx, pool, status, &name, &jit.encoded, shutdown, &stop).await;
-    status.set(Phase::Finishing);
+    let result = drive(ctx, pool, slot, name, &jit.encoded, shutdown, stop).await;
 
-    if let Err(e) = pool.backend.cleanup(&name).await {
+    if let Err(e) = pool.backend.cleanup(name).await {
         warn!(runner = %name, "cleanup failed, reconcile will retry: {e:#}");
     }
     if let Err(e) = ctx.gh.delete_runner(jit.runner_id).await {
@@ -409,20 +531,27 @@ async fn run_once(
 async fn drive(
     ctx: &Ctx,
     pool: &Pool,
-    status: &Slot,
+    slot: usize,
     name: &str,
     jit_config: &str,
     shutdown: &CancellationToken,
     stop: &CancellationToken,
 ) -> Result<Outcome> {
     let launched = Instant::now();
-    status.set(Phase::Launching);
     let mut running = tokio::select! {
         r = pool.backend.launch(name, jit_config, &pool.hook_env) => r.context("launching runner")?,
         _ = shutdown.cancelled() => return Ok(Outcome::Shutdown),
     };
-    status.watch(running.watch.clone());
-    status.set(Phase::Idle);
+    ctx.live.watch(&pool.cfg.name, slot, running.watch.clone());
+    ctx.slots.phase(&pool.cfg.name, slot, Phase::Idle);
+
+    enum Event {
+        Exited(Result<std::process::ExitStatus>),
+        TimedOut,
+        Stopped,
+        Shutdown,
+        Drained,
+    }
 
     // The timeout clock starts when a job starts, so idle runners can wait indefinitely.
     let timeout = Duration::from_secs(pool.cfg.job_timeout_minutes * 60);
@@ -431,19 +560,39 @@ async fn drive(
         let mut watch = watch.clone();
         async move {
             watch.wait_started().await;
+            ctx.slots.phase(&pool.cfg.name, slot, Phase::Busy);
             tokio::time::sleep(timeout).await;
         }
     };
+    // A runner that has stayed up this long isn't crash-looping, which clears the slot's failures.
+    // Never finishes; it only marks the slot.
+    let proven = async {
+        tokio::time::sleep(ctx.timing.quick_exit).await;
+        ctx.slots.proven(&pool.cfg.name, slot);
+        std::future::pending::<Event>().await
+    };
+    // A drain removes runners that are still waiting; one that has a job keeps it.
+    let drained_while_idle = {
+        let probe = watch.clone();
+        let mut drain = ctx.drain.subscribe();
+        async move {
+            loop {
+                if *drain.borrow() && !probe.has_started() {
+                    return;
+                }
+                tokio::select! {
+                    _ = drain.changed() => {}
+                    _ = tokio::time::sleep(Duration::from_secs(1)) => {}
+                }
+            }
+        }
+    };
 
-    enum Event {
-        Exited(Result<std::process::ExitStatus>),
-        TimedOut,
-        Stopped,
-        Shutdown,
-    }
     let event = tokio::select! {
+        event = proven => event,
         status = running.wait() => Event::Exited(status),
         _ = deadline => Event::TimedOut,
+        _ = drained_while_idle => Event::Drained,
         _ = stop.cancelled() => Event::Stopped,
         _ = shutdown.cancelled() => Event::Shutdown,
     };
@@ -454,7 +603,7 @@ async fn drive(
             let elapsed = launched.elapsed();
             // A runner that never picked up a job had a bad config, lost its registration or failed
             // to start; back off instead of hammering GitHub with registrations.
-            if !watch.has_started() && elapsed < QUICK_EXIT {
+            if !watch.has_started() && elapsed < ctx.timing.quick_exit {
                 (
                     Err(anyhow!(
                         "runner exited after {}s without running a job ({status})",
@@ -482,6 +631,11 @@ async fn drive(
             running.kill().await;
             (Ok(Outcome::Shutdown), Some("Interrupted"))
         }
+        Event::Drained => {
+            info!(runner = %name, "draining: removing the idle runner");
+            running.kill().await;
+            (Ok(Outcome::Drained), Some("Interrupted"))
+        }
     };
 
     if watch.has_started() {
@@ -502,23 +656,9 @@ async fn drive(
 
 /// Deletes GitHub registrations and backend resources that carry this machine's prefix but that
 /// no slot owns: leftovers from crashes, reboots and failed cleanups.
-async fn reconcile(ctx: &Ctx, pools: &[Arc<Pool>]) -> Result<()> {
-    let result = reconcile_inner(ctx, pools).await;
-    ctx.board.update(|s| {
-        let removed = result.as_ref().map_or(0, |n| *n);
-        s.reconcile = Some(state::ReconcileState {
-            at: timefmt::now(),
-            removed,
-            error: result.as_ref().err().map(|e| format!("{e:#}")),
-        });
-    });
-    result.map(|_| ())
-}
-
-/// Returns how many leftovers it removed.
-async fn reconcile_inner(ctx: &Ctx, pools: &[Arc<Pool>]) -> Result<usize> {
-    let mut removed = 0;
+pub async fn reconcile(ctx: &Ctx, pools: &[Arc<Pool>]) -> Result<()> {
     let runners = ctx.gh.list_runners().await?;
+    ctx.github_ok();
     for runner in runners
         .iter()
         .filter(|r| r.name.starts_with(&ctx.host_prefix))
@@ -531,9 +671,8 @@ async fn reconcile_inner(ctx: &Ctx, pools: &[Arc<Pool>]) -> Result<usize> {
             continue;
         }
         info!(runner = %runner.name, "removing stale runner registration");
-        match ctx.gh.delete_runner(runner.id).await {
-            Ok(()) => removed += 1,
-            Err(e) => warn!(runner = %runner.name, "{e:#}"),
+        if let Err(e) = ctx.gh.delete_runner(runner.id).await {
+            warn!(runner = %runner.name, "{e:#}");
         }
     }
     for pool in pools {
@@ -549,19 +688,53 @@ async fn reconcile_inner(ctx: &Ctx, pools: &[Arc<Pool>]) -> Result<usize> {
                 continue;
             }
             info!(pool = %pool.cfg.name, "removing orphaned {} {name}", pool.cfg.backend.kind());
-            match pool.backend.cleanup(&name).await {
-                Ok(()) => removed += 1,
-                Err(e) => warn!("{e:#}"),
+            if let Err(e) = pool.backend.cleanup(&name).await {
+                warn!("{e:#}");
             }
         }
     }
-    Ok(removed)
+    Ok(())
 }
 
-pub async fn status(path: &Path) -> Result<()> {
+pub async fn status(path: &Path, json: bool) -> Result<()> {
     let config = Config::load(path)?;
     let gh = GitHub::from_config(&config.github)?;
     let prefix = config.runner_prefix();
+    let local = health::read_state(&config.data_dir()).filter(|s| s.is_fresh(timefmt::now()));
+    let draining = health::drain_requested(&config.data_dir());
+    let runners = gh.list_runners().await.map(|mut runners| {
+        runners.retain(|r| r.name.starts_with(&prefix));
+        runners.sort_by(|a, b| a.name.cmp(&b.name));
+        runners
+    });
+
+    if json {
+        let pools: Vec<_> = config
+            .pools
+            .iter()
+            .map(|p| serde_json::json!({ "name": p.name, "backend": p.backend.kind(), "count": p.count }))
+            .collect();
+        let github = match &runners {
+            Ok(runners) => serde_json::json!({
+                "ok": true,
+                "runners": runners.iter().map(|r| serde_json::json!({
+                    "name": r.name, "status": r.status, "busy": r.busy,
+                })).collect::<Vec<_>>(),
+            }),
+            Err(e) => serde_json::json!({ "ok": false, "error": format!("{e:#}") }),
+        };
+        let out = serde_json::json!({
+            "host": config.host_name(),
+            "scope": gh.scope_label(),
+            "draining": draining,
+            "pools": pools,
+            "supervisor": local,
+            "github": github,
+        });
+        println!("{}", serde_json::to_string_pretty(&out)?);
+        return Ok(());
+    }
+
     println!("host {} → {}", config.host_name(), gh.scope_label());
     for pool in &config.pools {
         println!(
@@ -571,20 +744,56 @@ pub async fn status(path: &Path) -> Result<()> {
             pool.count
         );
     }
-    let mut runners: Vec<_> = gh
-        .list_runners()
-        .await?
-        .into_iter()
-        .filter(|r| r.name.starts_with(&prefix))
-        .collect();
-    runners.sort_by(|a, b| a.name.cmp(&b.name));
     let ledger = crate::ledger::load(&[config.ledger_path()]).unwrap_or_default();
     if let Some(summary) = crate::ledger::summary_line(&ledger) {
         println!("  lifetime: {summary}");
     }
     println!();
+    match &local {
+        None => println!(
+            "supervisor: not running (no recent state in {})",
+            config.data_dir().display()
+        ),
+        Some(state) => {
+            let now = timefmt::now();
+            println!(
+                "supervisor: pid {}, up {}{}",
+                state.pid,
+                crate::ledger::duration((now - state.started_at) as f64),
+                if state.draining { ", DRAINING" } else { "" }
+            );
+            for s in &state.slots {
+                println!(
+                    "  {:<20} slot {}  {:<8} for {}{}",
+                    s.pool,
+                    s.slot,
+                    format!("{:?}", s.phase).to_lowercase(),
+                    crate::ledger::duration((now - s.since).max(0) as f64),
+                    match (&s.last_error, s.consecutive_failures) {
+                        (Some(e), n) if n > 0 => format!(
+                            "  ({n} failure(s); last: {})",
+                            e.lines().next().unwrap_or("")
+                        ),
+                        _ => String::new(),
+                    }
+                );
+            }
+            for alert in &state.alerts {
+                println!("  ALERT {alert}");
+            }
+        }
+    }
+    println!();
+    let runners = runners?;
     if runners.is_empty() {
-        println!("no runners registered for this host (is home-runner running?)");
+        println!(
+            "no runners registered for this host ({})",
+            if draining {
+                "draining"
+            } else {
+                "is home-runner running?"
+            }
+        );
         return Ok(());
     }
     println!("{:<52} {:<8} JOB", "RUNNER", "STATUS");
@@ -607,18 +816,7 @@ pub async fn cleanup(path: &Path) -> Result<()> {
         accounting,
         pools,
     } = build(&config)?;
-    let board = Arc::new(Board::new(
-        &config.data_dir(),
-        base_state(&config, &gh, &pools),
-    ));
-    let ctx = Ctx {
-        gh,
-        accounting,
-        host_prefix: config.runner_prefix(),
-        active: Mutex::default(),
-        board,
-        job_done: Arc::new(Notify::new()),
-    };
+    let ctx = Ctx::new(gh, accounting, config.runner_prefix());
     reconcile(&ctx, &pools).await?;
     println!("cleanup complete");
     Ok(())
@@ -651,11 +849,283 @@ fn nanos() -> u128 {
         .as_nanos()
 }
 
-fn short_id() -> String {
+pub fn short_id() -> String {
     let n = nanos();
     format!("{:06x}", ((n ^ (n >> 24)) as u32) & 0xff_ffff)
 }
 
-fn jitter() -> Duration {
-    Duration::from_millis((nanos() % 2000) as u64)
+/// Up to 40% of the minimum backoff (2s at the default 5s), so slots don't retry in lockstep.
+fn jitter(min_backoff: Duration) -> Duration {
+    let max_ms = (min_backoff.as_millis() * 2 / 5).max(1);
+    Duration::from_millis((nanos() % max_ms) as u64)
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use crate::ledger;
+    use crate::testutil::{Harness, eventually};
+
+    /// A runner that picks up one job and finishes it.
+    const ONE_JOB: &str = "echo 'Running job: build'; sleep 0.2; \
+                           echo 'Job build completed with result: Succeeded'";
+    const IDLE: &str = "exec sleep 30";
+
+    fn phase(h: &Harness) -> Phase {
+        h.ctx.slots.snapshot()[0].phase
+    }
+
+    /// Runs the slot loop on a task and returns what's needed to stop it.
+    fn start_slot(h: &Harness) -> (CancellationToken, tokio::task::JoinHandle<()>) {
+        h.ctx.slots.register("t", 0);
+        let shutdown = CancellationToken::new();
+        let task = tokio::spawn(slot_loop(
+            h.ctx.clone(),
+            h.pool.clone(),
+            0,
+            shutdown.clone(),
+        ));
+        (shutdown, task)
+    }
+
+    async fn stop(shutdown: CancellationToken, task: tokio::task::JoinHandle<()>) {
+        shutdown.cancel();
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("slot loop didn't stop")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn reconcile_removes_only_what_nobody_owns() {
+        let h = Harness::new(IDLE).await;
+        h.mock.add_runner("hr-test-t-0-stale1", false);
+        h.mock.add_runner("hr-test-t-1-claimed", false);
+        h.mock.add_runner("hr-test-t-2-busy", true);
+        h.mock.add_runner("hr-other-t-0-theirs", false);
+        h.mock.add_runner("some-runner-i-made-by-hand", false);
+        {
+            let mut fake = h.fake.lock().unwrap();
+            fake.resources = [
+                "hr-test-t-0-stale1",
+                "hr-test-t-1-claimed",
+                "hr-other-t-0-theirs",
+            ]
+            .map(String::from)
+            .to_vec();
+        }
+        let _claim = Claim::new(&h.ctx.active, "hr-test-t-1-claimed");
+
+        reconcile(&h.ctx, std::slice::from_ref(&h.pool))
+            .await
+            .unwrap();
+
+        // Gone: the stale registration. Kept: the claimed one, a busy orphan (it may be finishing
+        // a job), other hosts' runners and anything without our prefix.
+        assert_eq!(
+            h.mock.names(),
+            [
+                "hr-other-t-0-theirs",
+                "hr-test-t-1-claimed",
+                "hr-test-t-2-busy",
+                "some-runner-i-made-by-hand",
+            ]
+        );
+        // The backend's stale VM is cleaned; the claimed one and another host's stay.
+        assert_eq!(
+            h.resources(),
+            ["hr-other-t-0-theirs", "hr-test-t-1-claimed"]
+        );
+        assert_eq!(h.fake.lock().unwrap().cleaned, ["hr-test-t-0-stale1"]);
+    }
+
+    #[tokio::test]
+    async fn reconcile_pages_through_every_runner() {
+        let h = Harness::new(IDLE).await;
+        for i in 0..230 {
+            h.mock.add_runner(&format!("hr-test-t-0-s{i:03}"), false);
+        }
+        reconcile(&h.ctx, std::slice::from_ref(&h.pool))
+            .await
+            .unwrap();
+        assert!(h.mock.names().is_empty());
+    }
+
+    #[tokio::test]
+    async fn one_job_register_run_record_clean_up() {
+        let h = Harness::new(ONE_JOB).await;
+        h.ctx.slots.register("t", 0);
+        let outcome = run_once(&h.ctx, &h.pool, 0, &CancellationToken::new())
+            .await
+            .unwrap();
+        assert!(matches!(outcome, Outcome::Completed));
+
+        // Registered once, with the pool's labels and the default runner group.
+        let state = h.mock.state.lock().unwrap();
+        assert_eq!(state.jit_requests.len(), 1);
+        let req = &state.jit_requests[0];
+        assert_eq!(
+            req["labels"],
+            serde_json::json!(["self-hosted", "Linux", "ARM64"])
+        );
+        assert_eq!(req["runner_group_id"], 1);
+        assert!(req["name"].as_str().unwrap().starts_with("hr-test-t-0-"));
+        // Deregistered and cleaned up afterwards.
+        assert!(state.runners.is_empty());
+        assert_eq!(state.deleted.len(), 1);
+        drop(state);
+        assert!(h.resources().is_empty());
+        let fake = h.fake.lock().unwrap();
+        assert_eq!(fake.cleaned, fake.launched);
+        drop(fake);
+
+        let records = ledger::load(std::slice::from_ref(&h.ledger)).unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].result, "Succeeded");
+        assert_eq!(records[0].pool, "t");
+    }
+
+    #[tokio::test]
+    async fn retries_failures_without_leaking_registrations() {
+        let h = Harness::new(IDLE).await;
+        h.fake.lock().unwrap().launch_failures = 2;
+        let (shutdown, task) = start_slot(&h);
+
+        eventually("the third attempt to reach idle", || {
+            phase(&h) == Phase::Idle
+        })
+        .await;
+        // Two failed attempts were registered and then deregistered; only the live one remains.
+        assert_eq!(h.mock.jit_requests(), 3);
+        assert_eq!(h.mock.names().len(), 1);
+        let slot = &h.ctx.slots.snapshot()[0];
+        assert_eq!(
+            slot.consecutive_failures, 2,
+            "idle alone doesn't clear the failures"
+        );
+        assert_eq!(
+            slot.last_error.as_deref(),
+            Some("launching runner: fake launch failure")
+        );
+
+        stop(shutdown, task).await;
+        assert!(
+            h.mock.names().is_empty(),
+            "shutdown deregisters the idle runner"
+        );
+        assert!(h.resources().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_runner_that_stays_up_clears_the_failures() {
+        let mut h = Harness::new(IDLE).await;
+        h.set_quick_exit(Duration::from_millis(300));
+        h.fake.lock().unwrap().launch_failures = 2;
+        let (shutdown, task) = start_slot(&h);
+        eventually("idle", || phase(&h) == Phase::Idle).await;
+        assert_eq!(h.ctx.slots.snapshot()[0].consecutive_failures, 2);
+        assert!(!h.ctx.slots.snapshot()[0].is_healthy());
+        eventually("proven", || h.ctx.slots.snapshot()[0].is_healthy()).await;
+        assert_eq!(h.ctx.slots.snapshot()[0].consecutive_failures, 0);
+        stop(shutdown, task).await;
+    }
+
+    #[tokio::test]
+    async fn a_runner_that_exits_without_a_job_is_a_failure() {
+        let h = Harness::new("exit 0").await;
+        let (shutdown, task) = start_slot(&h);
+        eventually("repeated failures", || {
+            h.ctx.slots.snapshot()[0].consecutive_failures >= 3
+        })
+        .await;
+        let slot = &h.ctx.slots.snapshot()[0];
+        assert!(
+            slot.last_error
+                .as_deref()
+                .unwrap()
+                .contains("without running a job")
+        );
+        stop(shutdown, task).await;
+        assert!(h.mock.names().is_empty());
+    }
+
+    #[tokio::test]
+    async fn registration_errors_back_off_and_recover() {
+        let h = Harness::new(IDLE).await;
+        h.mock.state.lock().unwrap().fail_jit = 2;
+        let (shutdown, task) = start_slot(&h);
+        eventually("recovery", || phase(&h) == Phase::Idle).await;
+        assert_eq!(
+            h.mock.jit_requests(),
+            1,
+            "only the successful call is recorded"
+        );
+        stop(shutdown, task).await;
+    }
+
+    #[tokio::test]
+    async fn draining_removes_idle_runners_and_resuming_brings_them_back() {
+        let h = Harness::new(IDLE).await;
+        let (shutdown, task) = start_slot(&h);
+        eventually("idle", || phase(&h) == Phase::Idle).await;
+        assert_eq!(h.mock.names().len(), 1);
+
+        h.ctx.drain.send_replace(true);
+        eventually("paused", || phase(&h) == Phase::Paused).await;
+        assert!(
+            h.mock.names().is_empty(),
+            "the idle runner must not be able to take a job"
+        );
+        assert!(h.resources().is_empty());
+        let registered = h.mock.jit_requests();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            h.mock.jit_requests(),
+            registered,
+            "no registrations while draining"
+        );
+
+        h.ctx.drain.send_replace(false);
+        eventually("idle again", || phase(&h) == Phase::Idle).await;
+        assert_eq!(h.mock.names().len(), 1);
+        stop(shutdown, task).await;
+    }
+
+    #[tokio::test]
+    async fn draining_lets_a_running_job_finish() {
+        // Starts a job, runs for a while, then completes.
+        let h = Harness::new(
+            "echo 'Running job: slow'; sleep 1; echo 'Job slow completed with result: Succeeded'",
+        )
+        .await;
+        let (shutdown, task) = start_slot(&h);
+        eventually("busy", || phase(&h) == Phase::Busy).await;
+
+        h.ctx.drain.send_replace(true);
+        eventually("paused after the job", || phase(&h) == Phase::Paused).await;
+
+        let records = ledger::load(std::slice::from_ref(&h.ledger)).unwrap();
+        assert_eq!(
+            records.len(),
+            1,
+            "the job was recorded, so it wasn't killed"
+        );
+        assert_eq!(records[0].result, "Succeeded");
+        assert_eq!(h.ctx.slots.snapshot()[0].jobs_done, 1);
+        assert!(h.mock.names().is_empty());
+        stop(shutdown, task).await;
+    }
+
+    #[tokio::test]
+    async fn shutdown_during_a_job_records_it_as_interrupted() {
+        let h = Harness::new("echo 'Running job: slow'; exec sleep 30").await;
+        let (shutdown, task) = start_slot(&h);
+        eventually("busy", || phase(&h) == Phase::Busy).await;
+        stop(shutdown, task).await;
+        let records = ledger::load(std::slice::from_ref(&h.ledger)).unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].result, "Interrupted");
+        assert!(h.mock.names().is_empty());
+        assert!(h.resources().is_empty());
+    }
 }

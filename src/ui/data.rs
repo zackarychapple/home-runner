@@ -8,8 +8,8 @@ use std::time::{Duration, Instant, SystemTime};
 
 use crate::config::Config;
 use crate::fleet::{self, FleetJob, FleetView};
+use crate::health::{self, State};
 use crate::ledger::{self, JobRecord};
-use crate::state::{self, State};
 use crate::{paths, timefmt};
 
 const LOCAL_EVERY: Duration = Duration::from_secs(1);
@@ -34,9 +34,9 @@ pub struct Snapshot {
 impl Snapshot {
     /// The supervisor is running if it has rewritten its state recently.
     pub fn daemon_running(&self) -> bool {
-        self.state.as_ref().is_some_and(|s| {
-            s.running && timefmt::now() - s.updated_at <= 4 * state::PUBLISH_SECS as i64
-        })
+        self.state
+            .as_ref()
+            .is_some_and(|s| s.is_fresh(timefmt::now()))
     }
 
     pub fn host(&self) -> String {
@@ -101,7 +101,7 @@ fn run(config_path: &Path, loader: &Loader, ctx: &eframe::egui::Context) {
             (snap.data_dir.clone(), snap.config.clone())
         };
 
-        let state = state::read(&data_dir);
+        let state = health::read_state(&data_dir);
         let ledger_path = data_dir.join(ledger::LEDGER_FILE);
         let ledger = changed(&ledger_path, &mut ledger_seen)
             .then(|| Arc::new(ledger::load(&[ledger_path]).unwrap_or_default()));

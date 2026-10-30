@@ -1,12 +1,15 @@
-//! `home-runner gui`: a desktop window over this machine's supervisor and, if it has joined one,
+//! `home-runner ui`: a desktop window over this machine's supervisor and, if it has joined one,
 //! the fleet. It only reads `state.json`, the ledger and the fleet Worker, and asks the supervisor
 //! to do things through files in the data dir, so it can be opened and closed at any time.
+//! The Stats tab is the ledger dashboard (`app`), which works without a config.
 
 mod active;
+mod app;
 mod data;
 mod fleet_tab;
 mod history;
 mod settings;
+mod stats;
 mod widgets;
 
 use std::path::PathBuf;
@@ -24,6 +27,7 @@ use widgets::{BAD, BORDER, MUTED, OK, WARN};
 enum Tab {
     Active,
     History,
+    Stats,
     Fleet,
     Settings,
 }
@@ -43,6 +47,7 @@ struct Task {
 
 pub struct App {
     loader: Arc<Loader>,
+    stats: app::App,
     tab: Tab,
     scope: Scope,
     history: history::HistoryUi,
@@ -56,7 +61,8 @@ pub struct App {
     toast: Option<(String, bool, Instant)>,
 }
 
-pub fn run(config_path: PathBuf) -> Result<()> {
+/// `ledgers` and `since` set up the Stats tab (by default, this machine's ledger).
+pub fn run(config_path: PathBuf, ledgers: Vec<PathBuf>, since: String) -> Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("home-runner")
@@ -71,6 +77,7 @@ pub fn run(config_path: PathBuf) -> Result<()> {
             style(&cc.egui_ctx);
             let loader = data::spawn(config_path, cc.egui_ctx.clone());
             Ok(Box::new(App {
+                stats: app::App::new(cc, ledgers, &since),
                 loader,
                 tab: Tab::Active,
                 scope: Scope::Host,
@@ -186,16 +193,15 @@ impl App {
         });
         ui.add_space(6.0);
         ui.horizontal(|ui| {
-            let running = snap.state.as_ref().map_or(0, |s| {
-                s.pools
-                    .iter()
-                    .flat_map(|p| &p.slots)
-                    .filter(|s| s.job.is_some())
-                    .count()
-            });
+            let running = snap
+                .state
+                .as_ref()
+                .filter(|_| snap.daemon_running())
+                .map_or(0, |s| s.slots.iter().filter(|s| s.job.is_some()).count());
             for (tab, label) in [
                 (Tab::Active, format!("Active  {running}")),
                 (Tab::History, "History".into()),
+                (Tab::Stats, "Stats".into()),
                 (Tab::Fleet, "Fleet".into()),
                 (Tab::Settings, "Settings".into()),
             ] {
@@ -223,7 +229,7 @@ impl App {
                     .button(RichText::new("Stop job").color(BAD))
                     .clicked()
                 {
-                    match crate::state::request_stop(&snap.data_dir, &runner) {
+                    match crate::live::request_stop(&snap.data_dir, &runner) {
                         Ok(()) => self.notify("Asked home-runner to stop the job", true),
                         Err(e) => self.notify(format!("Couldn't request stop: {e}"), false),
                     }
@@ -279,6 +285,11 @@ impl eframe::App for App {
                     });
                     ui.add_space(8.0);
                 }
+                if self.tab == Tab::Stats {
+                    // The dashboard lays out its own panels and scrolling.
+                    self.stats.show(ui);
+                    return;
+                }
                 egui::ScrollArea::vertical()
                     .auto_shrink([false; 2])
                     .show(ui, |ui| match self.tab {
@@ -286,6 +297,7 @@ impl eframe::App for App {
                         Tab::History => history::show(ui, self, &snap),
                         Tab::Fleet => fleet_tab::show(ui, self, &snap),
                         Tab::Settings => settings::show(ui, self, &snap),
+                        Tab::Stats => {}
                     });
             });
 

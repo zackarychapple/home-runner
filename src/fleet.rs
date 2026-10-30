@@ -7,7 +7,6 @@
 //! the machine or the Worker is offline; the Worker ignores records it already has. What leaves
 //! the machine is cut down to the `share` level first.
 
-use std::collections::HashMap;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -21,8 +20,10 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use crate::config::{Config, FleetConfig, Share};
+use crate::daemon::Ctx;
+use crate::health::{Phase, PoolState};
 use crate::ledger::JobRecord;
-use crate::state::{Board, FleetStatus, LiveJob, PoolState};
+use crate::live::LiveJob;
 use crate::timefmt;
 
 pub const CURSOR_FILE: &str = "fleet-cursor";
@@ -110,7 +111,7 @@ pub struct Day {
     pub saved_vs_github_usd: f64,
 }
 
-#[cfg_attr(not(feature = "gui"), allow(dead_code))]
+#[cfg_attr(not(feature = "ui"), allow(dead_code))]
 /// A job from any machine in the fleet.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
@@ -194,7 +195,7 @@ impl Client {
         Ok(check(resp).await?.json().await?)
     }
 
-    #[cfg_attr(not(feature = "gui"), allow(dead_code))]
+    #[cfg_attr(not(feature = "ui"), allow(dead_code))]
     pub async fn jobs(&self, since: i64, limit: usize) -> Result<Vec<FleetJob>> {
         #[derive(Deserialize)]
         struct Page {
@@ -395,11 +396,11 @@ pub struct Reporter {
     host: String,
     ledger: PathBuf,
     cursor: PathBuf,
-    board: Arc<Board>,
+    ctx: Arc<Ctx>,
 }
 
 impl Reporter {
-    pub fn new(config: &Config, board: Arc<Board>) -> Result<Option<Self>> {
+    pub fn new(config: &Config, ctx: Arc<Ctx>) -> Result<Option<Self>> {
         let Some(client) = Client::from_config(config)? else {
             return Ok(None);
         };
@@ -409,7 +410,7 @@ impl Reporter {
             host: config.host_name(),
             ledger: config.ledger_path(),
             cursor: config.data_dir().join(CURSOR_FILE),
-            board,
+            ctx,
         }))
     }
 
@@ -418,6 +419,13 @@ impl Reporter {
     pub async fn run(self, job_done: Arc<Notify>, shutdown: CancellationToken) {
         info!(url = %self.cfg.url, house = %self.cfg.house, share = self.cfg.share.as_str(), "reporting to fleet");
         let heartbeat = Duration::from_secs(self.cfg.heartbeat_secs.max(15));
+        // The first report should include the slots, which the monitor publishes on its first tick.
+        for _ in 0..40 {
+            if self.ctx.latest_state().is_some() || shutdown.is_cancelled() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
         loop {
             // Catch up in batches, then wait.
             while let Ok(true) = self.send(true).await {}
@@ -435,16 +443,18 @@ impl Reporter {
         let offset = read_cursor(&self.cursor);
         let (records, next, remaining) = read_from(&self.ledger, offset, BATCH)?;
         let sent = records.len();
-        let state = self.board.collect(&HashMap::new(), None);
         let (share, hash) = (self.cfg.share, self.cfg.hash_private_repos);
-        let pools = state
-            .pools
+        let pools = self
+            .ctx
+            .latest_state()
+            .map(|s| s.pools())
+            .unwrap_or_default()
             .into_iter()
             .map(|mut p| {
                 for slot in &mut p.slots {
                     slot.job = slot.job.take().map(|j| redact_live(j, share, hash));
                     if !online {
-                        slot.phase = crate::state::Phase::Stopped;
+                        slot.phase = Phase::Offline;
                     }
                 }
                 p
@@ -466,13 +476,10 @@ impl Reporter {
                 .collect(),
         };
         let status = |error: Option<String>, pending: usize| {
-            self.board.update(|s| {
-                let f = s.fleet.get_or_insert_with(|| FleetStatus {
-                    url: self.cfg.url.clone(),
-                    house: self.cfg.house.clone(),
-                    share: share.as_str().into(),
-                    ..Default::default()
-                });
+            self.ctx.update_fleet_status(|f| {
+                f.url.clone_from(&self.cfg.url);
+                f.house.clone_from(&self.cfg.house);
+                f.share = share.as_str().into();
                 if error.is_none() {
                     f.last_ok_at = Some(timefmt::now());
                 }

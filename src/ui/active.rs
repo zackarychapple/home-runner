@@ -8,8 +8,9 @@ use eframe::egui::{self, RichText, Ui, Vec2};
 use super::data::Snapshot;
 use super::widgets::{self, BAD, MUTED, OK, WARN};
 use super::{App, Scope};
+use crate::health::{Phase, PoolState, SlotState};
 use crate::ledger::JobRecord;
-use crate::state::{LiveJob, Phase, PoolState, SlotState};
+use crate::live::LiveJob;
 use crate::timefmt;
 
 /// A running job wherever it is.
@@ -40,17 +41,23 @@ pub fn show(ui: &mut Ui, app: &mut App, snap: &Snapshot) {
         });
     }
 
+    if app.scope == Scope::Host
+        && let Some(state) = snap.state.as_ref().filter(|_| snap.daemon_running())
+    {
+        supervisor_notices(ui, app, snap, state);
+    }
+
     let mut running = Vec::new();
-    let empty = Vec::new();
+    let local_pools: Vec<PoolState> = snap
+        .state
+        .as_ref()
+        .filter(|_| snap.daemon_running())
+        .map(|s| s.pools())
+        .unwrap_or_default();
     match app.scope {
         Scope::Host => {
-            let pools = snap
-                .state
-                .as_ref()
-                .filter(|_| snap.daemon_running())
-                .map_or(&empty, |s| &s.pools);
             let host = snap.state.as_ref().map_or("", |s| s.host.as_str());
-            for pool in pools {
+            for pool in &local_pools {
                 for slot in &pool.slots {
                     if let Some(job) = &slot.job {
                         running.push(Running {
@@ -114,14 +121,11 @@ pub fn show(ui: &mut Ui, app: &mut App, snap: &Snapshot) {
             let right = snap
                 .state
                 .as_ref()
-                .and_then(|s| s.reconcile.as_ref())
-                .map(|r| match &r.error {
-                    Some(_) => format!("cleanup failed {}", widgets::ago(r.at)),
-                    None => format!("cleanup {} · {} removed", widgets::ago(r.at), r.removed),
-                });
+                .filter(|_| snap.daemon_running())
+                .map(|s| format!("GitHub answered {}", widgets::ago(s.github_ok_at)));
             widgets::section(ui, "Runner slots", right);
-            if let Some(state) = snap.state.as_ref().filter(|_| snap.daemon_running()) {
-                pools(ui, &state.pools);
+            if !local_pools.is_empty() {
+                pools(ui, &local_pools);
             } else {
                 ui.label(RichText::new("No live slot information.").color(MUTED));
             }
@@ -326,7 +330,7 @@ fn job_card(
         ui.add_space(6.0);
         ui.horizontal(|ui| {
             if let Some(url) = &j.url
-                && ui.button("Open run ↗").clicked()
+                && ui.button("Open run").clicked()
             {
                 ui.ctx().open_url(egui::OpenUrl::new_tab(url));
             }
@@ -408,10 +412,47 @@ fn slot_pill(ui: &mut Ui, slot: &SlotState) {
     if let Some(runner) = &slot.runner {
         tip += &format!("\n{runner}");
     }
-    if let Some(error) = &slot.error {
+    if let Some(error) = &slot.last_error {
         tip += &format!("\n\nLast error: {error}");
     }
     resp.on_hover_text(tip);
+}
+
+/// Firing alerts and drain mode, from the supervisor's own health checks.
+fn supervisor_notices(ui: &mut Ui, app: &mut App, snap: &Snapshot, state: &crate::health::State) {
+    for alert in &state.alerts {
+        callout(ui, BAD, |ui| {
+            ui.label(RichText::new(alert).strong());
+        });
+    }
+    if state.draining {
+        callout(ui, WARN, |ui| {
+            ui.label(RichText::new("Draining.").strong());
+            ui.label("No new jobs start here; running jobs finish.");
+            if ui.button("Resume").clicked() {
+                match std::fs::remove_file(crate::health::drain_path(&snap.data_dir)) {
+                    Ok(()) => app.notify("Resumed: runners will register again", true),
+                    Err(e) => app.notify(format!("Couldn't resume: {e}"), false),
+                }
+            }
+        });
+    }
+}
+
+fn callout(ui: &mut Ui, color: egui::Color32, add: impl FnOnce(&mut Ui)) {
+    egui::Frame::new()
+        .fill(color.gamma_multiply(0.12))
+        .stroke(egui::Stroke::new(1.0, color.gamma_multiply(0.5)))
+        .corner_radius(6)
+        .inner_margin(egui::Margin::same(10))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal_wrapped(|ui| {
+                widgets::dot(ui, color);
+                add(ui);
+            });
+        });
+    ui.add_space(6.0);
 }
 
 /// Callouts for platforms only offline machines can run, so jobs for them will queue.
@@ -465,20 +506,10 @@ fn coverage_gaps(ui: &mut Ui, snap: &Snapshot) {
             )
         }
     };
-    egui::Frame::new()
-        .fill(WARN.gamma_multiply(0.12))
-        .stroke(egui::Stroke::new(1.0, WARN.gamma_multiply(0.5)))
-        .corner_radius(6)
-        .inner_margin(egui::Margin::same(10))
-        .show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            ui.horizontal_wrapped(|ui| {
-                widgets::dot(ui, WARN);
-                ui.label(RichText::new(title).strong());
-                ui.label(detail);
-            });
-        });
-    ui.add_space(6.0);
+    callout(ui, WARN, |ui| {
+        ui.label(RichText::new(title).strong());
+        ui.label(detail);
+    });
 }
 
 pub fn what(workflow: Option<&str>, job: Option<&str>) -> String {

@@ -40,6 +40,12 @@ annotate_jobs = true                # post "saved ~$X" on each workflow run
 # share = "repos"                   # totals | repos | full (see README, "Fleet")
 # hash_private_repos = true
 
+# Get a message when a pool can't keep a runner online (and when it recovers).
+# [alerts]
+# webhook_url = "https://hooks.slack.com/services/..."   # or a Discord webhook, ntfy.sh/<topic>, or your own URL
+# format = "slack"                # json (default), slack, discord, ntfy
+# stalled_minutes = 10
+
 # Linux arm64 jobs, one lightweight VM per job via Apple's `container`.
 #   runs-on: [self-hosted, Linux, ARM64]
 [[pool]]
@@ -62,7 +68,27 @@ arch = "amd64"
 cpus = 4
 memory = "8G"
 
-# macOS jobs in a throwaway Tart VM (at most 2 macOS VMs per Mac).
+# An ubuntu-latest-like image with Node, pnpm and Rust preinstalled and a persistent cache per slot.
+# Build the image first: ./images/ubuntu-latest/build.sh arm64
+#   runs-on: [self-hosted, home, ubuntu-latest]
+# Use a runner group limited to the repos that should land here, since the cache carries over
+# between their jobs.
+# [[pool]]
+# name = "ubuntu-latest"
+# backend = "apple-container"
+# runner_group_id = 2
+# count = 2
+# labels = ["home", "ubuntu-latest"]
+# image = "home-runner/ubuntu-latest:arm64"
+# pull = false
+# cache_size = "40G"
+# docker_in_job = true            # run dockerd in each job: docker build/run, container:, services:
+# cpus = 8
+# memory = "16G"
+
+# macOS jobs in a throwaway Tart VM (at most 2 macOS VMs per Mac). For an image with Node, pnpm,
+# Rust and sccache preinstalled and a persistent cache disk per slot, see images/macos-latest and
+# set image = "home-runner-macos-latest", ssh_key and cache_size = "150G".
 #   runs-on: [self-hosted, macOS, ARM64]
 [[pool]]
 name = "macos"

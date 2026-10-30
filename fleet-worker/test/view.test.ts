@@ -57,7 +57,7 @@ test("view groups machines into houses and hides stale live jobs", () => {
   assert.equal(studio.online, true);
   assert.equal(studio.pools[0].slots[0].job.repo, "acme/app");
   assert.equal(tower.online, false);
-  assert.equal(tower.pools[0].slots[0].phase, "stopped");
+  assert.equal(tower.pools[0].slots[0].phase, "offline");
   assert.equal(tower.pools[0].slots[0].job, null);
   assert.equal(view.month.saved_vs_github_usd, 3);
 });

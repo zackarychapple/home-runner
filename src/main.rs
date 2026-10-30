@@ -5,20 +5,24 @@ mod daemon;
 mod doctor;
 mod fleet;
 mod github;
-#[cfg(feature = "gui")]
-mod gui;
+mod health;
 mod hooks;
 mod init;
 mod ledger;
+mod live;
 mod logging;
 mod paths;
 mod power;
 mod pricing;
 mod proc;
 mod runner_dist;
+mod selftest;
 mod service;
-mod state;
+#[cfg(test)]
+mod testutil;
 mod timefmt;
+#[cfg(feature = "ui")]
+mod ui;
 
 use std::path::{Path, PathBuf};
 
@@ -63,24 +67,53 @@ enum Command {
         #[arg(long)]
         force: bool,
     },
-    /// Check GitHub access and that every pool's backend is ready.
+    /// Check GitHub access, that every pool's backend is ready, and how isolated each pool is.
     Doctor {
         #[command(flatten)]
         config: ConfigArg,
+        /// Exit non-zero on warnings too (open runner groups, readable credentials, …).
+        #[arg(long)]
+        strict: bool,
     },
-    /// Open the desktop app: live jobs, history, savings, the fleet and settings.
-    #[cfg(feature = "gui")]
-    Gui {
+    /// Start a runner of each pool, wait for GitHub to see it online, then tear it down and check
+    /// nothing was left behind. Stop the service first.
+    Selftest {
         #[command(flatten)]
         config: ConfigArg,
+        /// Only test this pool.
+        #[arg(long)]
+        pool: Option<String>,
+        /// How long to wait for a runner to come online.
+        #[arg(long, default_value = "5m")]
+        timeout: String,
     },
     /// Run the supervisor in the foreground.
     Run {
         #[command(flatten)]
         config: ConfigArg,
     },
-    /// Show this machine's runners as GitHub sees them.
+    /// Show what the supervisor is doing and this machine's runners as GitHub sees them.
     Status {
+        #[command(flatten)]
+        config: ConfigArg,
+        /// Machine-readable output.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Stop taking jobs: idle runners are removed, running jobs finish. For upgrades and
+    /// maintenance; `resume` undoes it.
+    Drain {
+        #[command(flatten)]
+        config: ConfigArg,
+        /// Wait until no job is running.
+        #[arg(long)]
+        wait: bool,
+        /// With --wait, give up after this long.
+        #[arg(long, default_value = "6h", requires = "wait")]
+        timeout: String,
+    },
+    /// Take jobs again after `drain`.
+    Resume {
         #[command(flatten)]
         config: ConfigArg,
     },
@@ -130,6 +163,14 @@ enum Command {
         #[command(subcommand)]
         command: FleetCommand,
     },
+    /// Open the desktop app: running jobs, history, savings stats, the fleet and settings.
+    #[cfg(feature = "ui")]
+    Ui {
+        #[command(flatten)]
+        config: ConfigArg,
+        #[command(flatten)]
+        query: LedgerQuery,
+    },
     /// List the hosted-runner prices used for savings estimates.
     Prices,
     /// Print machine-wide CPU counters (used by the job hooks).
@@ -146,11 +187,35 @@ enum Command {
 fn main() -> Result<()> {
     match Cli::parse().command {
         Command::Init { config, force } => init::write(&config.path(), force),
-        Command::Doctor { config } => runtime()?.block_on(doctor::run(&config.path())),
-        #[cfg(feature = "gui")]
-        Command::Gui { config } => gui::run(config.path()),
+        Command::Doctor { config, strict } => {
+            runtime()?.block_on(doctor::run(&config.path(), strict))
+        }
+        Command::Selftest {
+            config,
+            pool,
+            timeout,
+        } => {
+            // The runner's console output would bury the step results; HOME_RUNNER_LOG=info shows it.
+            let _log = logging::init_with_default(None, "warn");
+            let timeout = timefmt::parse_since(&timeout)?
+                .ok_or_else(|| anyhow::anyhow!("--timeout must be a duration like 5m"))?;
+            runtime()?.block_on(selftest::run(&config.path(), pool.as_deref(), timeout))
+        }
         Command::Run { config } => run_foreground(&config.path()),
-        Command::Status { config } => runtime()?.block_on(daemon::status(&config.path())),
+        Command::Status { config, json } => {
+            runtime()?.block_on(daemon::status(&config.path(), json))
+        }
+        Command::Drain {
+            config,
+            wait,
+            timeout,
+        } => {
+            let config = config::Config::load(&config.path())?;
+            let timeout = timefmt::parse_since(&timeout)?
+                .ok_or_else(|| anyhow::anyhow!("--timeout must be a duration like 6h"))?;
+            runtime()?.block_on(health::drain(&config, wait.then_some(timeout)))
+        }
+        Command::Resume { config } => health::resume(&config::Config::load(&config.path())?),
         Command::Cleanup { config } => {
             let _log = logging::init(None);
             runtime()?.block_on(daemon::cleanup(&config.path()))
@@ -180,6 +245,11 @@ fn main() -> Result<()> {
             Ok(())
         }
         Command::Fleet { command } => runtime()?.block_on(fleet_command(command)),
+        #[cfg(feature = "ui")]
+        Command::Ui { config, query } => {
+            let ledgers = query.paths(&config);
+            ui::run(config.path(), ledgers, query.since)
+        }
         Command::Prices => {
             print_prices();
             Ok(())
@@ -236,8 +306,8 @@ struct LedgerQuery {
 }
 
 impl LedgerQuery {
-    fn load(&self, config: &ConfigArg) -> Result<Vec<ledger::JobRecord>> {
-        let paths = if self.ledgers.is_empty() {
+    fn paths(&self, config: &ConfigArg) -> Vec<PathBuf> {
+        if self.ledgers.is_empty() {
             // The ledger lives next to the config; don't require valid GitHub credentials to read it.
             let data_dir = config::Config::load(&config.path())
                 .map(|c| c.data_dir())
@@ -245,7 +315,11 @@ impl LedgerQuery {
             vec![data_dir.join(ledger::LEDGER_FILE)]
         } else {
             self.ledgers.clone()
-        };
+        }
+    }
+
+    fn load(&self, config: &ConfigArg) -> Result<Vec<ledger::JobRecord>> {
+        let paths = self.paths(config);
         let since = timefmt::parse_since(&self.since)?.map(|d| timefmt::now() - d.as_secs() as i64);
         let filter = ledger::Filter {
             since,
@@ -301,7 +375,7 @@ async fn fleet_command(command: FleetCommand) -> Result<()> {
                     let slots: Vec<_> = h.pools.iter().flat_map(|p| &p.slots).collect();
                     let busy = slots
                         .iter()
-                        .filter(|s| s.phase == state::Phase::Busy)
+                        .filter(|s| s.phase == health::Phase::Busy)
                         .count();
                     println!(
                         "    {:<22} {:<8} {}/{} busy  {}",

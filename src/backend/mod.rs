@@ -1,3 +1,5 @@
+#[cfg(test)]
+pub(crate) mod fake;
 mod host;
 mod oci;
 mod tart;
@@ -24,6 +26,9 @@ pub enum Backend {
     Host(HostBackend),
     Oci(OciBackend),
     Tart(TartBackend),
+    #[cfg(test)]
+    #[cfg_attr(not(unix), allow(dead_code))]
+    Fake(fake::FakeBackend),
 }
 
 /// A launched runner. When `job` exits, the runner has finished (or failed) its single job.
@@ -77,7 +82,7 @@ impl Backend {
                 Backend::Oci(OciBackend::new(OciKind::AppleContainer, c.clone()))
             }
             BackendConfig::Docker(c) => Backend::Oci(OciBackend::new(OciKind::Docker, c.clone())),
-            BackendConfig::Tart(c) => Backend::Tart(TartBackend::new(c.clone(), dist)),
+            BackendConfig::Tart(c) => Backend::Tart(TartBackend::new(c.clone(), data_dir, dist)),
         }
     }
 
@@ -87,6 +92,8 @@ impl Backend {
             Backend::Host(b) => b.platform_labels(),
             Backend::Oci(b) => b.platform_labels(),
             Backend::Tart(b) => b.platform_labels(),
+            #[cfg(test)]
+            Backend::Fake(_) => vec!["Linux".into(), "ARM64".into()],
         }
     }
 
@@ -96,6 +103,8 @@ impl Backend {
             Backend::Host(b) => b.prepare().await,
             Backend::Oci(b) => b.prepare().await,
             Backend::Tart(b) => b.prepare().await,
+            #[cfg(test)]
+            Backend::Fake(_) => Ok(()),
         }
     }
 
@@ -105,6 +114,8 @@ impl Backend {
             Backend::Host(_) => host_cpus(),
             Backend::Oci(b) => b.cpus(),
             Backend::Tart(b) => b.cpus(),
+            #[cfg(test)]
+            Backend::Fake(_) => 2,
         }
     }
 
@@ -119,6 +130,8 @@ impl Backend {
             Backend::Host(b) => b.launch(name, jit_config, hook_env).await,
             Backend::Oci(b) => b.launch(name, jit_config, hook_env).await,
             Backend::Tart(b) => b.launch(name, jit_config, hook_env).await,
+            #[cfg(test)]
+            Backend::Fake(b) => b.launch(name, jit_config).await,
         }
     }
 
@@ -128,6 +141,8 @@ impl Backend {
         match self {
             Backend::Host(b) => b.collect(name).await,
             Backend::Oci(_) | Backend::Tart(_) => HashMap::new(),
+            #[cfg(test)]
+            Backend::Fake(_) => HashMap::new(),
         }
     }
 
@@ -137,6 +152,8 @@ impl Backend {
             Backend::Host(b) => b.cleanup(name).await,
             Backend::Oci(b) => b.cleanup(name).await,
             Backend::Tart(b) => b.cleanup(name).await,
+            #[cfg(test)]
+            Backend::Fake(b) => b.cleanup(name).await,
         }
     }
 
@@ -146,6 +163,8 @@ impl Backend {
             Backend::Host(b) => b.list(prefix).await,
             Backend::Oci(b) => b.list(prefix).await,
             Backend::Tart(b) => b.list(prefix).await,
+            #[cfg(test)]
+            Backend::Fake(b) => b.list(prefix).await,
         }
     }
 
@@ -155,6 +174,8 @@ impl Backend {
             Backend::Host(b) => b.check().await,
             Backend::Oci(b) => b.check().await,
             Backend::Tart(b) => b.check().await,
+            #[cfg(test)]
+            Backend::Fake(_) => Ok("fake".into()),
         }
     }
 }

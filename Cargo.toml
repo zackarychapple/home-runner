@@ -14,7 +14,11 @@ publish = false
 anyhow = "1"
 base64 = "0.22"
 clap = { version = "4", features = ["derive"] }
-eframe = { version = "0.37", optional = true }
+# Desktop app (`home-runner ui`); build with --no-default-features for a headless-only binary.
+# `links` lets "Open run" open the browser.
+eframe = { version = "0.37", default-features = false, features = ["default_fonts", "glow", "links"], optional = true }
+egui_extras = { version = "0.37", default-features = false, optional = true }
+egui_plot = { version = "0.38", optional = true }
 gethostname = "1"
 # native-tls keeps the build free of C toolchains: Security.framework on macOS, SChannel on Windows.
 reqwest = { version = "0.12", default-features = false, features = ["json", "native-tls"] }
@@ -30,11 +34,6 @@ tracing = "0.1"
 tracing-appender = "0.2"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
-[features]
-# `home-runner gui`. Build with --no-default-features for a headless supervisor.
-default = ["gui"]
-gui = ["dep:eframe"]
-
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
@@ -47,3 +46,6 @@ lto = true
 codegen-units = 1
 strip = true
 
+[features]
+default = ["ui"]
+ui = ["dep:eframe", "dep:egui_extras", "dep:egui_plot"]

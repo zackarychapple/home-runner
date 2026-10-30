@@ -128,7 +128,7 @@ function stripLive(pools: unknown[]): unknown[] {
     const pool = p as { slots?: unknown[] };
     return {
       ...pool,
-      slots: (pool.slots ?? []).map((s) => ({ ...(s as object), phase: "stopped", job: null })),
+      slots: (pool.slots ?? []).map((s) => ({ ...(s as object), phase: "offline", job: null })),
     };
   });
 }

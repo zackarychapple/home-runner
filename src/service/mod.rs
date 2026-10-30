@@ -48,7 +48,7 @@ pub fn uninstall() -> Result<()> {
 }
 
 /// Restarts the installed service or agent.
-#[cfg_attr(not(feature = "gui"), allow(dead_code))]
+#[cfg_attr(not(feature = "ui"), allow(dead_code))]
 pub fn restart() -> Result<()> {
     #[cfg(target_os = "macos")]
     return launchd::restart();

@@ -9,7 +9,7 @@ use super::App;
 use super::data::Snapshot;
 use super::widgets::{self, BAD, MUTED, OK, WARN};
 use crate::config::Share;
-use crate::state::Phase;
+use crate::health::Phase;
 
 #[derive(Default)]
 pub struct JoinUi {

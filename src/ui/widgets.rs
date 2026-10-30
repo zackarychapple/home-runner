@@ -5,7 +5,7 @@ use eframe::egui::{
     StrokeKind, Ui, Vec2,
 };
 
-use crate::state::Phase;
+use crate::health::Phase;
 use crate::timefmt;
 
 pub const OK: Color32 = Color32::from_rgb(63, 185, 80);
@@ -21,9 +21,9 @@ pub const SUBTLE: Color32 = Color32::from_rgb(33, 38, 45);
 pub fn phase_color(phase: Phase) -> Color32 {
     match phase {
         Phase::Busy => OK,
-        Phase::Launching | Phase::Registering | Phase::Preparing | Phase::Finishing => INFO,
+        Phase::Starting => INFO,
         Phase::Backoff => WARN,
-        Phase::Idle | Phase::Stopped => MUTED,
+        Phase::Idle | Phase::Paused | Phase::Offline => MUTED,
     }
 }
 

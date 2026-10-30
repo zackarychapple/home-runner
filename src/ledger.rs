@@ -235,7 +235,7 @@ pub fn write_csv(out: &mut impl Write, records: &[JobRecord]) -> Result<()> {
     Ok(())
 }
 
-#[derive(Clone, Copy, clap::ValueEnum)]
+#[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum GroupBy {
     Repo,
     Actor,
@@ -246,24 +246,59 @@ pub enum GroupBy {
     Month,
 }
 
+impl GroupBy {
+    pub fn key(self, r: &JobRecord) -> String {
+        match self {
+            GroupBy::Repo => r.repo.clone().unwrap_or_else(|| "(unknown)".into()),
+            GroupBy::Actor => r
+                .triggering_actor
+                .clone()
+                .or_else(|| r.actor.clone())
+                .unwrap_or_else(|| "(unknown)".into()),
+            GroupBy::Pool => format!("{}/{}", r.host, r.pool),
+            GroupBy::Host => r.host.clone(),
+            GroupBy::Workflow => format!(
+                "{} · {}",
+                r.repo.as_deref().unwrap_or("?"),
+                r.workflow.as_deref().unwrap_or("?")
+            ),
+            GroupBy::Day => timefmt::day(r.started_at),
+            GroupBy::Month => timefmt::month(r.started_at),
+        }
+    }
+
+    #[cfg(feature = "ui")]
+    pub fn label(self) -> &'static str {
+        match self {
+            GroupBy::Repo => "Repo",
+            GroupBy::Actor => "Actor",
+            GroupBy::Pool => "Host / pool",
+            GroupBy::Host => "Host",
+            GroupBy::Workflow => "Repo · workflow",
+            GroupBy::Day => "Day",
+            GroupBy::Month => "Month",
+        }
+    }
+}
+
 #[derive(Default)]
-struct Totals {
-    jobs: usize,
-    secs: f64,
-    cpu_secs: f64,
-    capacity_secs: f64,
-    github: f64,
-    depot: f64,
-    own: f64,
-    saved_github: f64,
-    saved_depot: f64,
-    failed: usize,
-    queued_secs: f64,
-    queued_jobs: usize,
+pub(crate) struct Totals {
+    pub jobs: usize,
+    pub secs: f64,
+    pub cpu_secs: f64,
+    pub capacity_secs: f64,
+    pub github: f64,
+    pub depot: f64,
+    pub own: f64,
+    pub saved_github: f64,
+    pub saved_depot: f64,
+    pub failed: usize,
+    pub queued_secs: f64,
+    pub queued_jobs: usize,
 }
 
 impl Totals {
-    fn add(&mut self, r: &JobRecord) {
+    pub fn add(&mut self, r: &JobRecord) {
         self.jobs += 1;
         self.secs += r.duration_secs;
         if let Some(cpu) = r.cpu_seconds {
@@ -284,7 +319,7 @@ impl Totals {
         }
     }
 
-    fn utilization(&self) -> String {
+    pub fn utilization(&self) -> String {
         if self.capacity_secs > 0.0 {
             format!("{:.0}%", 100.0 * self.cpu_secs / self.capacity_secs)
         } else {
@@ -302,23 +337,7 @@ pub fn print_savings(records: &[JobRecord], by: GroupBy, period: &str) {
     let mut groups: BTreeMap<String, Totals> = BTreeMap::new();
     for r in records {
         total.add(r);
-        let key = match by {
-            GroupBy::Repo => r.repo.clone().unwrap_or_else(|| "(unknown)".into()),
-            GroupBy::Actor => r
-                .triggering_actor
-                .clone()
-                .or_else(|| r.actor.clone())
-                .unwrap_or_else(|| "(unknown)".into()),
-            GroupBy::Pool => format!("{}/{}", r.host, r.pool),
-            GroupBy::Host => r.host.clone(),
-            GroupBy::Workflow => format!(
-                "{} · {}",
-                r.repo.as_deref().unwrap_or("?"),
-                r.workflow.as_deref().unwrap_or("?")
-            ),
-            GroupBy::Day => timefmt::day(r.started_at),
-            GroupBy::Month => timefmt::month(r.started_at),
-        };
+        let key = by.key(r);
         groups.entry(key).or_default().add(r);
     }
 
@@ -435,7 +454,7 @@ pub fn duration(secs: f64) -> String {
     }
 }
 
-fn hours(secs: f64) -> String {
+pub fn hours(secs: f64) -> String {
     format!("{:.1}h", secs / 3600.0)
 }
 

@@ -513,7 +513,7 @@ fn details(ui: &mut Ui, r: &JobRecord, typical: &BTreeMap<String, f64>) {
         ui.add_space(6.0);
         ui.horizontal(|ui| {
             if let Some(url) = &r.url
-                && ui.button("Open run ↗").clicked()
+                && ui.button("Open run").clicked()
             {
                 ui.ctx().open_url(egui::OpenUrl::new_tab(url));
             }
