@@ -8,7 +8,9 @@ use anyhow::{Context, Result, ensure};
 use tokio::process::Command;
 use tracing::debug;
 
-use super::{ProbeOutput, Running, arch_label, os_label, probe_output};
+#[cfg(unix)]
+use super::probe_output;
+use super::{ProbeOutput, Running, arch_label, os_label};
 use crate::hooks;
 use crate::proc::{self, pipe_output};
 use crate::runner_dist::{RunnerDist, host_os_arch};
