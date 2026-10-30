@@ -301,6 +301,19 @@ The probe then proves it, in the worker, as the runner user, and reports each fa
 | `gui:access` | the helper cannot reach the login session from the job context, or Accessibility / event posting is not granted (revoked, or the helper was replaced by a differently signed build) |
 | `gui:input` | the disposable test app could not be activated (focus), or a key press, click or drag was posted but never reached it (delivery) |
 
+**Finder scripting (`kind = "macos-finder"`).** Tauri's DMG bundler lays the disk image window out (background, size, icon positions from `bundle.macOS.dmg`) with an AppleScript that drives Finder. It skips that when `CI` is set unless the workflow sets `TAURI_BUNDLER_DMG_IGNORE_CI=true`. Without a login session and a granted Automation permission, Finder never answers and the build fails after the two-minute AppleEvent timeout (`Finder got an error: AppleEvent timed out. (-1712)`), long after the build, signing and notarization succeeded. The requirement stands alone, so a release pool gets it without the input helper or Accessibility grant that `macos-gui` needs. The probe asks Finder for its startup disk's name from the same ssh context jobs run in, so a worker that can't do it never takes a job:
+
+```toml
+[[profile.require]]
+kind = "macos-finder"
+```
+
+```sh
+./images/macos-latest/build.sh FINDER=true   # opens the VM window; click Allow on "wants access to control Finder"
+```
+
+`FINDER=true` combines with `GUI=true`, `NATIVE=true` and `PROVISION=false`. The grant is made once per image and survives clones and reboots, but a rebuild clones a fresh VM and asks again. The probe tells the causes apart: `-1743` means Automation was refused (reset it with `tccutil reset AppleEvents` in the image and grant again), `-1712` means the consent prompt is still waiting (nobody can click it in a headless job) or Finder is not responding, and `-600`/`-609` mean there is no Finder session to reach (turn on automatic login). A workflow that doesn't need the window layout can instead drop `TAURI_BUNDLER_DMG_IGNORE_CI` and build on any worker.
+
 `hr-input` refuses to post input anywhere but inside a virtual machine, so a test or an operator can never move the keyboard focus or pointer of a real desktop. `macos-gui` is rejected on `host` pools for the same reason. Each Tart worker is its own VM with its own WindowServer, so two workers running at once cannot steal each other's input focus; within one worker, use `exclusive`.
 
 ### A `macos-latest`-like Tart image with warm caches

@@ -273,6 +273,7 @@ pub fn script(profile: &ProfileConfig, platform_key: &str) -> String {
             Requirement::Playwright(p) => out.push_str(&playwright(p, platform_key)),
             Requirement::TauriCef(r) => out.push_str(&native::tauri_cef_script(r)),
             Requirement::MacosGui(r) => out.push_str(&native::gui_script(r)),
+            Requirement::MacosFinder(_) => out.push_str(&native::finder_script()),
         }
     }
     out
@@ -405,7 +406,7 @@ pub fn evaluate(profile: &ProfileConfig, ctx: &EvalCtx, out: &ProbeOutput) -> Ve
                 Requirement::Playwright(_) => id == "playwright:platform",
                 Requirement::TauriCef(_) => id == "native:platform",
                 // Each step builds on the one before: no point posting input without a session.
-                Requirement::MacosGui(_) => true,
+                Requirement::MacosGui(_) | Requirement::MacosFinder(_) => true,
                 _ => false,
             };
             broken |= stops && !check.status.is_ok();
@@ -457,6 +458,7 @@ fn judge(req: &Requirement, id: &str, fact: &Fact, ctx: &EvalCtx) -> Check {
         }
         (Requirement::TauriCef(r), status) => native::judge_tauri_cef(r, id, status, &detail, ctx),
         (Requirement::MacosGui(r), status) => native::judge_gui(r, id, status, &detail, ctx),
+        (Requirement::MacosFinder(_), status) => native::judge_finder(id, status, &detail, ctx),
         (_, "ok") => Check::new(id, Status::Ok, detail),
         (_, "missing") => Check::new(id, Status::Missing, detail).hint(repair(req, ctx)),
         (Requirement::Docker(d), _) => explain_docker(id, d.image.as_str(), &detail, ctx),
@@ -589,7 +591,10 @@ fn repair(req: &Requirement, ctx: &EvalCtx) -> String {
             root = p.root.trim_end_matches('/'),
             key = ctx.platform_key
         ),
-        (Requirement::TauriCef(_) | Requirement::MacosGui(_), _) => {
+        (
+            Requirement::TauriCef(_) | Requirement::MacosGui(_) | Requirement::MacosFinder(_),
+            _,
+        ) => {
             "provision the golden image with images/macos-latest/build.sh (README: Native prerequisites)"
                 .into()
         }

@@ -68,6 +68,14 @@ pub struct MacosGuiReq {
     pub revision: String,
 }
 
+/// The runner user's session may script Finder over Apple events. Tauri's DMG bundler lays the
+/// disk image window out with an AppleScript that drives Finder; without a login session and a
+/// granted Automation permission it hangs until the AppleEvent times out, and the build fails
+/// after everything else, signing and notarization included, has succeeded.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct MacosFinderReq {}
+
 fn default_tools_env() -> String {
     "WITH_TAP_NATIVE_TOOLS_DIR".into()
 }
@@ -107,12 +115,16 @@ pub const TAURI_CEF_IDS: [&str; 14] = [
     "signing",
 ];
 pub const GUI_IDS: [&str; 4] = ["session", "helper", "access", "input"];
+pub const FINDER_ID: &str = "finder:automation";
 
 pub fn tauri_cef_ids() -> Vec<String> {
     TAURI_CEF_IDS
         .iter()
         .map(|s| format!("native:{s}"))
         .collect()
+}
+pub fn finder_ids() -> Vec<String> {
+    vec![FINDER_ID.to_string()]
 }
 pub fn gui_ids() -> Vec<String> {
     GUI_IDS.iter().map(|s| format!("gui:{s}")).collect()
@@ -352,6 +364,15 @@ const GUI: &str = r#"hr_gui_probe() {
 hr_gui_probe
 "#;
 
+const FINDER: &str = r#"hr_finder_probe() {
+  # What Tauri's DMG bundler does: ask Finder something over Apple events, from this same context.
+  # The AppleScript timeout keeps an unanswered consent prompt from stalling the probe.
+  out=$(osascript -e 'with timeout of 20 seconds' -e 'tell application "Finder" to get name of startup disk' -e 'end timeout' 2>&1); rc=$?
+  hr_emit finder:automation ok "rc=$rc | out=$(printf '%s' "$out" | tr '\n|' '  ' | cut -c1-200)"
+}
+hr_finder_probe
+"#;
+
 pub fn tauri_cef_script(r: &TauriCefReq) -> String {
     let body = TAURI_CEF
         .replace("@TOOLS@", &sh_quote(r.tools_dir.trim_end_matches('/')))
@@ -363,6 +384,10 @@ pub fn tauri_cef_script(r: &TauriCefReq) -> String {
 
 pub fn gui_script(r: &MacosGuiReq) -> String {
     format!("{HELPERS}{}", GUI.replace("@HELPER@", &sh_quote(&r.helper)))
+}
+
+pub fn finder_script() -> String {
+    format!("{HELPERS}{FINDER}")
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -585,6 +610,52 @@ fn judge_cef(r: &TauriCefReq, id: &str, f: &HashMap<&str, &str>, repair: &str) -
         id,
         Status::Ok,
         format!("{} ({})", get("version"), get("archs")),
+    )
+}
+
+pub fn judge_finder(id: &str, status: &str, detail: &str, ctx: &EvalCtx) -> Check {
+    let fail =
+        |what: String, hint: &str| Check::new(id, Status::Failed, what).hint(hint.to_string());
+    if status != "ok" {
+        return fail(detail.to_string(), "see the probe output");
+    }
+    let f = fields(detail);
+    let rc = f.get("rc").copied().unwrap_or("");
+    let out = f.get("out").copied().unwrap_or("");
+    if rc == "0" {
+        return Check::new(id, Status::Ok, "Finder answers Apple events");
+    }
+    let grant = format!(
+        "grant the runner user Automation access to Finder once, in the golden image: \
+         `images/macos-latest/build.sh FINDER=true` opens the VM window and waits for Allow on \
+         \"wants access to control Finder\" (pool {})",
+        ctx.pool
+    );
+    if out.contains("-1743") || out.contains("Not authorized") {
+        return fail(
+            format!("Automation is denied: the runner may not control Finder ({out})"),
+            &format!("{grant}; if it was refused, reset it with `tccutil reset AppleEvents`"),
+        );
+    }
+    if out.contains("-1712") || out.contains("timed out") {
+        return fail(
+            "Finder did not answer within 20s: Tauri's DMG layout step would hang the same way"
+                .into(),
+            &format!(
+                "{grant}. A consent prompt nobody can answer in a headless job looks exactly like this"
+            ),
+        );
+    }
+    if out.contains("-600") || out.contains("-609") || out.contains("isn't running") {
+        return fail(
+            format!("Finder is not reachable from this session ({out})"),
+            "turn on automatic login for the runner user in the golden image so a Finder session \
+             exists",
+        );
+    }
+    fail(
+        format!("Finder could not be scripted (exit {rc}): {out}"),
+        &grant,
     )
 }
 
@@ -1078,6 +1149,47 @@ mod tests {
         );
         // The install script computes the same revision with `shasum -a 256` of the file.
         assert!(HELPER_SOURCE.contains("kern.hv_vmm_present"));
+    }
+
+    fn jf(detail: &str) -> Check {
+        judge_finder(FINDER_ID, "ok", detail, &ctx())
+    }
+
+    #[test]
+    fn finder_failures_are_told_apart() {
+        assert_eq!(jf("rc=0 | out=Macintosh HD").status, Status::Ok);
+        let denied = jf(
+            "rc=1 | out=execution error: Not authorized to send Apple events to Finder. (-1743)",
+        );
+        assert_eq!(denied.status, Status::Failed);
+        assert!(
+            denied.detail.starts_with("Automation is denied"),
+            "{}",
+            denied.detail
+        );
+        assert!(denied.hint.unwrap().contains("FINDER=true"));
+
+        // The failure from the-ai-platform's first release on the home runner.
+        let hung =
+            jf("rc=1 | out=execution error: Finder got an error: AppleEvent timed out. (-1712)");
+        assert!(
+            hung.detail.starts_with("Finder did not answer within 20s"),
+            "{}",
+            hung.detail
+        );
+        assert!(hung.hint.unwrap().contains("consent prompt"));
+
+        let gone = jf("rc=1 | out=Connection is invalid. (-609)");
+        assert!(
+            gone.detail.starts_with("Finder is not reachable"),
+            "{}",
+            gone.detail
+        );
+        assert!(gone.hint.unwrap().contains("automatic login"));
+
+        let other = jf("rc=2 | out=boom");
+        assert_eq!(other.status, Status::Failed);
+        assert!(other.detail.contains("exit 2"));
     }
 
     #[test]
@@ -1624,6 +1736,34 @@ mod tests {
                 checks.iter().filter(|c| c.id.starts_with("gui:")).count(),
                 GUI_IDS.len()
             );
+        }
+
+        #[test]
+        fn a_finder_that_never_answers_keeps_the_pool_unready() {
+            if root() {
+                return;
+            }
+            let fx = Fixture::new();
+            let p: ProfileConfig =
+                toml::from_str("name = \"f\"\n[[require]]\nkind = \"macos-finder\"\n").unwrap();
+            p.validate().unwrap();
+
+            fx.tool(
+                "osascript",
+                "echo 'Finder got an error: AppleEvent timed out. (-1712)' >&2; exit 1",
+            );
+            let checks = fx.run(&p);
+            let finder = find(&checks, "finder:automation");
+            assert_eq!(finder.status, Status::Failed);
+            assert!(
+                finder.detail.starts_with("Finder did not answer"),
+                "{}",
+                finder.detail
+            );
+
+            fx.tool("osascript", "echo 'Macintosh HD'");
+            let checks = fx.run(&p);
+            assert_eq!(find(&checks, "finder:automation").status, Status::Ok);
         }
 
         #[test]
