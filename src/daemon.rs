@@ -210,6 +210,12 @@ pub fn build(config: &Config) -> Result<Built> {
             let mut hook_env = accounting.hook_env(&pricing);
             if let Some(p) = &prereq {
                 hook_env.extend(p.job_env());
+                if matches!(cfg.backend, crate::config::BackendConfig::Tart(_)) {
+                    hook_env.push((
+                        crate::backend::tart::CACHE_IDENTITY_ENV.into(),
+                        p.fingerprint.clone(),
+                    ));
+                }
             }
             Ok(Arc::new(Pool {
                 prefix: format!("{host_prefix}{}-", cfg.name),

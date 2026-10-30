@@ -2,7 +2,7 @@
 pub(crate) mod fake;
 mod host;
 mod oci;
-mod tart;
+pub(crate) mod tart;
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -218,6 +218,15 @@ impl Backend {
             Backend::Tart(b) => b.probe(name, script, timeout).await,
             #[cfg(test)]
             Backend::Fake(b) => b.probe(name).await,
+        }
+    }
+
+    /// What the pool's golden image is right now, for backends whose image is a local VM. Part of
+    /// what a verification is remembered against.
+    pub fn worker_identity(&self) -> Option<String> {
+        match self {
+            Backend::Tart(b) => Some(b.image_identity()),
+            _ => None,
         }
     }
 

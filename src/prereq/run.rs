@@ -207,7 +207,12 @@ pub async fn readiness_key(backend: &Backend, prov: &Provision) -> String {
         Some(tag) => backend.image_info(tag).await.ok().flatten().map(|i| i.id),
         None => None,
     };
-    format!("{}:{}", prov.fingerprint, id.unwrap_or_default())
+    format!(
+        "{}:{}:{}",
+        prov.fingerprint,
+        id.unwrap_or_default(),
+        backend.worker_identity().unwrap_or_default()
+    )
 }
 
 /// Builds the derived image for a pool in `image` mode. Does nothing if it is already up to date

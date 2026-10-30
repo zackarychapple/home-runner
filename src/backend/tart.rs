@@ -5,13 +5,14 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use tokio::process::Command;
 use tracing::info;
 
 use super::{ProbeOutput, Running, probe_output};
 use crate::config::TartConfig;
 use crate::hooks;
-use crate::paths::expand_home;
+use crate::paths::{expand_home, home_dir};
 use crate::proc::{self, output, pipe_output};
 use crate::runner_dist::RunnerDist;
 
@@ -65,6 +66,12 @@ impl TartBackend {
         self.copy_self(&ip).await?;
 
         let asset = self.dist.asset("osx", "arm64").await?;
+        // A pool with prerequisites ties its cache to the profile and the image it was verified
+        // against, so a new toolchain or image never reuses build output made by the old one.
+        let identity = hook_env
+            .iter()
+            .find(|(k, _)| k == CACHE_IDENTITY_ENV)
+            .map(|(_, profile)| format!("{profile}:{}", self.image_identity()));
         let mut job = self
             .ssh(&ip)
             .arg(runner_script(
@@ -74,6 +81,7 @@ impl TartBackend {
                 jit_config,
                 hook_env,
                 self.cfg.cache_size.is_some(),
+                identity.as_deref(),
             ))
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -131,7 +139,7 @@ impl TartBackend {
             let (_vm, ip) = self.boot(name, false).await?;
             let out = self
                 .ssh(&ip)
-                .arg(format!("/bin/sh -c {}", sh_quote(script)))
+                .arg(format!("/bin/sh -c {}", sh_quote(&probe_script(script))))
                 .stdin(Stdio::null())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
@@ -145,6 +153,18 @@ impl TartBackend {
             Ok(result) => result,
             Err(_) => bail!("the probe did not finish within {}s", timeout.as_secs()),
         }
+    }
+
+    /// What the golden image is right now: a digest of its configuration plus its disk's size and
+    /// modification time. Rebuilding or replacing the image changes it, which makes the pool
+    /// verify its prerequisites again and empties the slots' cache disks.
+    pub fn image_identity(&self) -> String {
+        let home = std::env::var_os("TART_HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| home_dir().join(".tart"));
+        directory_identity(&home.join("vms").join(&self.cfg.image))
+            // A registry reference is pulled on first use; its name is all there is to go on.
+            .unwrap_or_else(|| format!("ref:{}", self.cfg.image))
     }
 
     /// Creates the slot's cache disk the first time it's needed, as a sparse file that only takes
@@ -303,6 +323,47 @@ impl TartBackend {
     }
 }
 
+/// Set by the supervisor on pools that have a profile: the profile's fingerprint.
+pub const CACHE_IDENTITY_ENV: &str = "HOME_RUNNER_CACHE_IDENTITY";
+
+/// `config.json` plus the disk's size and modification time, for a local VM directory.
+fn directory_identity(vm: &Path) -> Option<String> {
+    let config = std::fs::read(vm.join("config.json")).ok()?;
+    let disk = std::fs::metadata(vm.join("disk.img")).ok()?;
+    let modified = disk
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map_or(0, |d| d.as_secs());
+    let digest = Sha256::digest(&config);
+    let short: String = digest.iter().take(8).map(|b| format!("{b:02x}")).collect();
+    Some(format!("{short}-{}-{modified}", disk.len()))
+}
+
+/// What a probe runs: the same preparation a job gets, so it sees the same tools and variables.
+fn probe_script(script: &str) -> String {
+    format!(
+        "{SH_CACHE_DIR}[ ! -f \"$HOME/.home-runner/env\" ] || . \"$HOME/.home-runner/env\"\n{script}"
+    )
+}
+
+/// Empties a cache that was filled for another image or profile, then records which one it is for.
+fn sh_cache_stamp(identity: &str) -> String {
+    format!(
+        r#"stamp={}
+old=$(cat "$c/.home-runner-identity" 2>/dev/null || true)
+if [ "$old" != "$stamp" ]; then
+  if [ -n "$old" ]; then
+    echo "home-runner: the image or its prerequisites changed since this cache was filled, clearing it"
+    find "$c" -mindepth 1 -maxdepth 1 ! -name '.*' -exec rm -rf {{}} +
+  fi
+  printf '%s\n' "$stamp" > "$c/.home-runner-identity"
+fi
+"#,
+        sh_quote(identity)
+    )
+}
+
 /// A blank disk is this slot's new cache disk, so format it; the VM's own disk is never blank.
 /// macOS mounts it at /Volumes/HRCache, which the image links to /cache. HFS+, because an APFS
 /// volume on a VM's internal disk is keyed to that VM's boot disk, and the next job's fresh clone
@@ -347,14 +408,16 @@ fn runner_script(
     jit_config: &str,
     hook_env: &[(String, String)],
     cache: bool,
+    cache_identity: Option<&str>,
 ) -> String {
     let exports: String = hook_env
         .iter()
         .map(|(k, v)| format!("export {k}={}\n", sh_quote(v)))
         .collect();
+    let stamp = cache_identity.map(sh_cache_stamp).unwrap_or_default();
     let setup = if cache {
         format!(
-            r#"{SH_MOUNT_CACHE}RUNNER_DIR="{runner_dir}"
+            r#"{SH_MOUNT_CACHE}{stamp}RUNNER_DIR="{runner_dir}"
 t=$c/actions-runner-dist/actions-runner-osx-arm64-{version}.tar.gz
 if [ "$(cat "$RUNNER_DIR/.home-runner-version" 2>/dev/null)" != "{version}" ]; then
   if [ ! -f "$t" ]; then
@@ -467,7 +530,7 @@ mod tests {
 
     #[test]
     fn cache_script_puts_a_real_work_folder_on_the_cache_disk() {
-        let script = runner_script(None, "https://x/r.tgz", "2.330.0", "jit", &[], true);
+        let script = runner_script(None, "https://x/r.tgz", "2.330.0", "jit", &[], true, None);
         let mount = script.find("eraseDisk JHFS+").unwrap();
         let clear = script.find("is ${used}% full").unwrap();
         let unpack = script.find("tar -xzf").unwrap();
@@ -479,9 +542,48 @@ mod tests {
             !script.contains("ln -s"),
             "the work folder must not be a symlink"
         );
-        let plain = runner_script(None, "u", "v", "j", &[], false);
+        let plain = runner_script(None, "u", "v", "j", &[], false, None);
         assert!(!plain.contains("eraseDisk"));
         assert!(plain.contains("RUNNER_DIR=\"$HOME/actions-runner\""));
+    }
+
+    #[test]
+    fn a_cache_is_cleared_when_the_image_or_profile_it_was_filled_for_changes() {
+        let script = runner_script(None, "u", "v", "j", &[], true, Some("fp1:img1"));
+        let clear = script.find("is ${used}% full").unwrap();
+        let stamp = script.find("stamp='fp1:img1'").unwrap();
+        let unpack = script.find("tar -xzf").unwrap();
+        assert!(
+            clear < stamp && stamp < unpack,
+            "stamp goes between the space check and the runner"
+        );
+        assert!(script.contains("prerequisites changed since this cache was filled"));
+        // A pool without prerequisites keeps its cache across image rebuilds, as before.
+        let plain = runner_script(None, "u", "v", "j", &[], true, None);
+        assert!(!plain.contains(".home-runner-identity"));
+    }
+
+    #[test]
+    fn probes_get_the_environment_a_job_gets() {
+        let wrapped = probe_script("echo hi");
+        let cache = wrapped.find("mkdir -p").unwrap();
+        let env = wrapped.find(".home-runner/env").unwrap();
+        assert!(cache < env && env < wrapped.find("echo hi").unwrap());
+    }
+
+    #[test]
+    fn the_image_identity_changes_when_the_config_or_disk_does() {
+        let dir = crate::testutil::temp_dir("tart-id");
+        assert_eq!(directory_identity(&dir), None, "no VM there");
+        std::fs::write(dir.join("config.json"), "{\"cpu\":4}").unwrap();
+        std::fs::write(dir.join("disk.img"), vec![0u8; 1024]).unwrap();
+        let first = directory_identity(&dir).unwrap();
+        assert_eq!(directory_identity(&dir).unwrap(), first);
+        std::fs::write(dir.join("config.json"), "{\"cpu\":8}").unwrap();
+        let second = directory_identity(&dir).unwrap();
+        assert_ne!(first, second);
+        std::fs::write(dir.join("disk.img"), vec![0u8; 2048]).unwrap();
+        assert_ne!(directory_identity(&dir).unwrap(), second);
     }
 
     /// Set HOME_RUNNER_DUMP to a directory to write the VM scripts there for manual testing.
@@ -489,7 +591,7 @@ mod tests {
     fn dump_runner_script() {
         if let Ok(dir) = std::env::var("HOME_RUNNER_DUMP") {
             for (file, cache) in [("tart-cache.sh", true), ("tart.sh", false)] {
-                let script = runner_script(None, "URL", "VERSION", "JIT", &[], cache);
+                let script = runner_script(None, "URL", "VERSION", "JIT", &[], cache, None);
                 std::fs::write(Path::new(&dir).join(file), script).unwrap();
             }
         }

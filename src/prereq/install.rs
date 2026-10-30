@@ -56,6 +56,9 @@ hr_apt() {
             // The daemon comes from the image (dockerd) and the pool (docker_in_job); there is
             // nothing for a build to add that wouldn't be a guess.
             Requirement::Docker(_) => {}
+            // macOS-only: Tart images are built by images/macos-latest/build.sh, never by a
+            // derived container image.
+            Requirement::TauriCef(_) | Requirement::MacosGui(_) => {}
             Requirement::Playwright(p) => {
                 apt_used = true;
                 let root = p.root.trim_end_matches('/');

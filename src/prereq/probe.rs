@@ -8,7 +8,7 @@
 
 use std::collections::HashMap;
 
-use super::{InstallMode, PlaywrightReq, ProfileConfig, Requirement};
+use super::{InstallMode, PlaywrightReq, ProfileConfig, Requirement, native};
 use crate::backend::ProbeOutput;
 
 /// Output lines that carry results start with this and are tab-separated.
@@ -44,7 +44,7 @@ pub struct Check {
 }
 
 impl Check {
-    fn new(id: &str, status: Status, detail: impl Into<String>) -> Self {
+    pub(super) fn new(id: &str, status: Status, detail: impl Into<String>) -> Self {
         Self {
             id: id.into(),
             status,
@@ -54,7 +54,7 @@ impl Check {
         }
     }
 
-    fn hint(mut self, hint: impl Into<String>) -> Self {
+    pub(super) fn hint(mut self, hint: impl Into<String>) -> Self {
         self.hint = Some(hint.into());
         self
     }
@@ -271,6 +271,8 @@ pub fn script(profile: &ProfileConfig, platform_key: &str) -> String {
                 );
             }
             Requirement::Playwright(p) => out.push_str(&playwright(p, platform_key)),
+            Requirement::TauriCef(r) => out.push_str(&native::tauri_cef_script(r)),
+            Requirement::MacosGui(r) => out.push_str(&native::gui_script(r)),
         }
     }
     out
@@ -381,7 +383,13 @@ pub fn evaluate(profile: &ProfileConfig, ctx: &EvalCtx, out: &ProbeOutput) -> Ve
         let mut broken = false;
         let first = checks.len();
         for id in req.check_ids() {
+            // Native steps build on each other, so one that follows a failure is not judged on
+            // whatever the script happened to print.
+            let skip = broken && matches!(req, Requirement::TauriCef(_) | Requirement::MacosGui(_));
             let check = match facts.get(&id) {
+                Some(_) if skip => {
+                    Check::new(&id, Status::Skipped, "not run: an earlier step failed")
+                }
                 Some(fact) => judge(req, &id, fact, ctx),
                 None if broken => {
                     Check::new(&id, Status::Skipped, "not run: an earlier step failed")
@@ -395,6 +403,9 @@ pub fn evaluate(profile: &ProfileConfig, ctx: &EvalCtx, out: &ProbeOutput) -> Ve
             let stops = match req {
                 Requirement::Docker(_) => true,
                 Requirement::Playwright(_) => id == "playwright:platform",
+                Requirement::TauriCef(_) => id == "native:platform",
+                // Each step builds on the one before: no point posting input without a session.
+                Requirement::MacosGui(_) => true,
                 _ => false,
             };
             broken |= stops && !check.status.is_ok();
@@ -444,6 +455,8 @@ fn judge(req: &Requirement, id: &str, fact: &Fact, ctx: &EvalCtx) -> Check {
                 Check::new(id, Status::Ok, detail)
             }
         }
+        (Requirement::TauriCef(r), status) => native::judge_tauri_cef(r, id, status, &detail, ctx),
+        (Requirement::MacosGui(r), status) => native::judge_gui(r, id, status, &detail, ctx),
         (_, "ok") => Check::new(id, Status::Ok, detail),
         (_, "missing") => Check::new(id, Status::Missing, detail).hint(repair(req, ctx)),
         (Requirement::Docker(d), _) => explain_docker(id, d.image.as_str(), &detail, ctx),
@@ -576,6 +589,10 @@ fn repair(req: &Requirement, ctx: &EvalCtx) -> String {
             root = p.root.trim_end_matches('/'),
             key = ctx.platform_key
         ),
+        (Requirement::TauriCef(_) | Requirement::MacosGui(_), _) => {
+            "provision the golden image with images/macos-latest/build.sh (README: Native prerequisites)"
+                .into()
+        }
         (Requirement::Docker(_), _) => {
             "use an image with dockerd and set `docker_in_job = true` on the pool (README: Docker inside jobs)".into()
         }

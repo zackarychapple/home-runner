@@ -421,6 +421,25 @@ impl Config {
                      on a Windows host pool",
                     pool.name
                 );
+                if let Some(profile) = profile {
+                    ensure!(
+                        !profile.needs_macos()
+                            || matches!(
+                                pool.backend,
+                                BackendConfig::Tart(_) | BackendConfig::Host(_)
+                            ),
+                        "pool {:?}: profile {name:?} has macOS native requirements (tauri-cef, \
+                         macos-gui), so it needs a `tart` pool",
+                        pool.name
+                    );
+                    ensure!(
+                        profile.macos_gui().is_none()
+                            || matches!(pool.backend, BackendConfig::Tart(_)),
+                        "pool {:?}: profile {name:?} sends real keyboard and pointer events, which \
+                         must only go to a throwaway Tart VM, never the desktop of a `host` pool",
+                        pool.name
+                    );
+                }
                 if let (
                     Some(profile),
                     BackendConfig::AppleContainer(c) | BackendConfig::Docker(c),
