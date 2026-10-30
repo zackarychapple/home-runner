@@ -1,11 +1,14 @@
+use std::collections::HashMap;
+use std::path::Path;
 use std::process::Stdio;
 use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
+use serde_json::Value;
 use tokio::process::Command;
 use tracing::{debug, info, warn};
 
-use super::{Running, arch_label};
+use super::{ImageInfo, ProbeOutput, Running, arch_label, probe_output};
 use crate::config::OciConfig;
 use crate::hooks;
 use crate::proc::{self, output, pipe_output};
@@ -204,6 +207,124 @@ impl OciBackend {
         Ok(volume)
     }
 
+    /// Runs `script` in a throwaway container made the way a job's is (same image, user,
+    /// resources and extra arguments), after starting the in-job Docker daemon if asked.
+    pub async fn probe(
+        &self,
+        name: &str,
+        script: &str,
+        start_docker: bool,
+        timeout: Duration,
+    ) -> Result<ProbeOutput> {
+        let args = self.probe_args(name, script, start_docker);
+        let child = Command::new(self.program())
+            .args(&args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .map_err(|e| proc::spawn_error(self.program(), e))?;
+        // On a timeout the future is dropped, which kills the client; the caller removes the
+        // container by name.
+        match tokio::time::timeout(timeout, child.wait_with_output()).await {
+            Ok(out) => Ok(probe_output(out?)),
+            Err(_) => bail!("the probe did not finish within {}s", timeout.as_secs()),
+        }
+    }
+
+    fn probe_args(&self, name: &str, script: &str, start_docker: bool) -> Vec<String> {
+        let mut args: Vec<String> = vec!["run".into(), "--rm".into(), "--name".into(), name.into()];
+        if let Some(cpus) = self.cfg.cpus {
+            args.extend(["--cpus".into(), cpus.to_string()]);
+        }
+        if let Some(memory) = &self.cfg.memory {
+            args.extend(["--memory".into(), memory.clone()]);
+        }
+        args.extend(self.arch_args());
+        if start_docker {
+            match self.kind {
+                OciKind::AppleContainer => {
+                    for cap in DOCKER_CAPS {
+                        args.extend(["--cap-add".into(), (*cap).into()]);
+                    }
+                }
+                OciKind::Docker => args.push("--privileged".into()),
+            }
+        }
+        args.extend(self.cfg.extra_args.iter().cloned());
+        args.push(self.cfg.image.clone());
+        args.extend([
+            "/bin/sh".into(),
+            "-c".into(),
+            probe_wrapper(script, start_docker),
+            "home-runner".into(),
+        ]);
+        args
+    }
+
+    /// The local image `reference`, if there is one.
+    pub async fn image_info(&self, reference: &str) -> Result<Option<ImageInfo>> {
+        let json = match output(self.program(), &["image", "inspect", reference]).await {
+            Ok(json) => json,
+            Err(e) if e.to_string().contains("not found on PATH") => return Err(e),
+            Err(e) => {
+                debug!("no local image {reference}: {e:#}");
+                return Ok(None);
+            }
+        };
+        parse_image_info(&json, self.arch().unwrap_or(host_oci_arch())).map(Some)
+    }
+
+    /// `docker build` / `container build` of `dockerfile`, tagged `tag`.
+    pub async fn build_image(
+        &self,
+        tag: &str,
+        dockerfile: &str,
+        dir: &Path,
+        no_cache: bool,
+    ) -> Result<()> {
+        tokio::fs::create_dir_all(dir).await?;
+        let file = dir.join("Dockerfile");
+        tokio::fs::write(&file, dockerfile).await?;
+        let mut args = vec!["build".to_string()];
+        if no_cache {
+            args.push("--no-cache".into());
+        }
+        args.extend(self.arch_args());
+        args.extend([
+            "--tag".into(),
+            tag.into(),
+            "--file".into(),
+            file.display().to_string(),
+        ]);
+        args.push(dir.display().to_string());
+        info!(%tag, "building the prerequisite image");
+        let built = Command::new(self.program())
+            .args(&args)
+            .stdin(Stdio::null())
+            .kill_on_drop(true)
+            .output()
+            .await
+            .map_err(|e| proc::spawn_error(self.program(), e))?;
+        let _ = tokio::fs::remove_dir_all(dir).await;
+        if !built.status.success() {
+            let text = format!(
+                "{}\n{}",
+                String::from_utf8_lossy(&built.stdout),
+                String::from_utf8_lossy(&built.stderr)
+            );
+            let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
+            let tail = lines[lines.len().saturating_sub(40)..].join("\n");
+            bail!(
+                "`{} build` failed ({}); the end of its output:\n{tail}",
+                self.program(),
+                built.status
+            );
+        }
+        Ok(())
+    }
+
     pub async fn cleanup(&self, name: &str) -> Result<()> {
         let args: &[&str] = match self.kind {
             OciKind::AppleContainer => &["delete", "--force", name],
@@ -351,6 +472,62 @@ fn wrapper_script(cache: bool, docker: bool) -> String {
     )
 }
 
+/// The shell a probe runs in: the same preamble a job gets (state dir, in-job Docker daemon), then
+/// the probe. Everything it learns is on stdout, so the exit status is always 0.
+fn probe_wrapper(script: &str, docker: bool) -> String {
+    format!(
+        "d=/tmp/home-runner\nmkdir -p \"$d\"\n{}{script}\n{}exit 0\n",
+        if docker {
+            sh_docker_up(false)
+        } else {
+            String::new()
+        },
+        if docker { SH_DOCKER_DOWN } else { "" },
+    )
+}
+
+fn host_oci_arch() -> &'static str {
+    match std::env::consts::ARCH {
+        "x86_64" => "amd64",
+        _ => "arm64",
+    }
+}
+
+/// Reads `docker image inspect` or `container image inspect` output. Docker reports one image;
+/// Apple's CLI reports an index with a variant per architecture, of which `arch` is the one that
+/// runs here.
+fn parse_image_info(json: &str, arch: &str) -> Result<ImageInfo> {
+    let value: Value = serde_json::from_str(json).context("parsing `image inspect` output")?;
+    let entry = value.get(0).context("`image inspect` returned nothing")?;
+    let (id, config) = match entry.get("variants").and_then(Value::as_array) {
+        Some(variants) => {
+            let variant = variants
+                .iter()
+                .find(|v| v["config"]["architecture"] == arch)
+                .or_else(|| variants.first())
+                .context("the image has no variants")?;
+            (entry["id"].as_str(), &variant["config"]["config"])
+        }
+        None => (entry["Id"].as_str(), &entry["Config"]),
+    };
+    let labels: HashMap<String, String> = config["Labels"]
+        .as_object()
+        .map(|o| {
+            o.iter()
+                .filter_map(|(k, v)| Some((k.clone(), v.as_str()?.to_string())))
+                .collect()
+        })
+        .unwrap_or_default();
+    Ok(ImageInfo {
+        id: id.unwrap_or_default().to_string(),
+        user: config["User"]
+            .as_str()
+            .filter(|u| !u.is_empty())
+            .map(String::from),
+        labels,
+    })
+}
+
 /// Apple's container services stop on reboot until something starts them again.
 async fn ensure_apple_container_running() -> Result<()> {
     if output("container", &["system", "status"]).await.is_ok() {
@@ -465,6 +642,69 @@ mod tests {
                 .unwrap();
             assert!(status.success(), "cache={cache} docker={docker}\n{script}");
         }
+    }
+
+    #[test]
+    fn a_probe_container_is_made_like_a_job_container() {
+        let b = backend(
+            OciKind::AppleContainer,
+            "cpus = 4\nmemory = \"8G\"\narch = \"amd64\"\ndocker_in_job = true",
+        );
+        let args = b.probe_args("hrp-x", "echo hi", true);
+        assert_eq!(&args[..4], ["run", "--rm", "--name", "hrp-x"]);
+        assert_eq!(pairs(&args, "--cpus"), ["4"]);
+        assert_eq!(pairs(&args, "--arch"), ["amd64"]);
+        assert_eq!(pairs(&args, "--cap-add").len(), DOCKER_CAPS.len());
+        // The same image and entry shell as a job, so the same default user.
+        let image = args.iter().position(|a| a == "img").unwrap();
+        assert_eq!(&args[image + 1..image + 3], ["/bin/sh", "-c"]);
+        // No volumes or sockets: a probe must not touch the slot's cache or the host's daemon.
+        assert!(
+            !args[..image]
+                .iter()
+                .any(|a| a.contains("volume") || a.contains("docker.sock"))
+        );
+
+        let plain = backend(OciKind::Docker, "").probe_args("n", "echo hi", false);
+        assert!(!plain.contains(&"--privileged".to_string()));
+        let docker = backend(OciKind::Docker, "docker_in_job = true").probe_args("n", "x", true);
+        assert!(docker.contains(&"--privileged".to_string()));
+    }
+
+    #[test]
+    fn the_probe_wrapper_starts_and_stops_dockerd_around_the_probe() {
+        let with = probe_wrapper("PROBE_BODY", true);
+        let up = with.find("dockerd --host").unwrap();
+        let body = with.find("PROBE_BODY").unwrap();
+        let down = with.find("kill \"$dp\"").unwrap();
+        assert!(up < body && body < down);
+        // The daemon's data lives in the container, not the slot's cache volume.
+        assert!(with.contains("sh /var/lib/docker "));
+        assert!(!probe_wrapper("PROBE_BODY", false).contains("dockerd"));
+        assert!(with.ends_with("exit 0\n"));
+    }
+
+    #[test]
+    fn reads_docker_and_apple_image_inspect_output() {
+        let docker = r#"[{"Id":"sha256:abc","Config":{"User":"runner","Labels":{"a":"b"}}}]"#;
+        let info = parse_image_info(docker, "arm64").unwrap();
+        assert_eq!(info.id, "sha256:abc");
+        assert_eq!(info.user.as_deref(), Some("runner"));
+        assert_eq!(info.labels["a"], "b");
+
+        let apple = r#"[{"id":"b7037f","variants":[
+            {"config":{"architecture":"amd64","config":{"User":"root","Labels":{"v":"x86"}}}},
+            {"config":{"architecture":"arm64","config":{"User":"runner","Labels":{"v":"arm"}}}}]}]"#;
+        let info = parse_image_info(apple, "arm64").unwrap();
+        assert_eq!(
+            (info.id.as_str(), info.user.as_deref()),
+            ("b7037f", Some("runner"))
+        );
+        assert_eq!(info.labels["v"], "arm");
+        // An image with no user set is root.
+        let bare = parse_image_info(r#"[{"Id":"i","Config":{"User":""}}]"#, "arm64").unwrap();
+        assert_eq!(bare.user, None);
+        assert!(parse_image_info("[]", "arm64").is_err());
     }
 
     /// Set HOME_RUNNER_DUMP to a directory to write the container wrapper there for manual testing.

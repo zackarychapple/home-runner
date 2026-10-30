@@ -11,6 +11,7 @@ mod ledger;
 mod logging;
 mod paths;
 mod power;
+mod prereq;
 mod pricing;
 mod proc;
 mod runner_dist;
@@ -72,6 +73,12 @@ enum Command {
         /// Exit non-zero on warnings too (open runner groups, readable credentials, …).
         #[arg(long)]
         strict: bool,
+    },
+    /// Check, install and repair the job prerequisites (`[[profile]]`) of each pool that sets
+    /// `profile`: tools, libraries, Playwright browsers and Docker, verified inside a worker.
+    Prereq {
+        #[command(subcommand)]
+        action: PrereqAction,
     },
     /// Start a runner of each pool, wait for GitHub to see it online, then tear it down and check
     /// nothing was left behind. Stop the service first.
@@ -183,6 +190,25 @@ fn main() -> Result<()> {
         Command::Doctor { config, strict } => {
             runtime()?.block_on(doctor::run(&config.path(), strict))
         }
+        Command::Prereq { action } => {
+            let _log = logging::init_with_default(None, "warn");
+            match action {
+                PrereqAction::Inspect { config, pool } => {
+                    runtime()?.block_on(prereq::run::inspect(&config.path(), pool.as_deref()))
+                }
+                PrereqAction::Install {
+                    config,
+                    pool,
+                    dry_run,
+                    force,
+                } => runtime()?.block_on(prereq::run::install_cmd(
+                    &config.path(),
+                    pool.as_deref(),
+                    dry_run,
+                    force,
+                )),
+            }
+        }
         Command::Selftest {
             config,
             pool,
@@ -251,6 +277,34 @@ fn main() -> Result<()> {
         }
         Command::Service { config } => service::run_service(config.path()),
     }
+}
+
+#[derive(Subcommand)]
+enum PrereqAction {
+    /// Probe a throwaway worker of each pool as the runner user and report what is missing.
+    Inspect {
+        #[command(flatten)]
+        config: ConfigArg,
+        /// Only this pool.
+        #[arg(long)]
+        pool: Option<String>,
+    },
+    /// Build the derived image that has the missing requirements, then verify it. Safe to
+    /// repeat; does nothing when the image is already up to date.
+    #[command(alias = "repair")]
+    Install {
+        #[command(flatten)]
+        config: ConfigArg,
+        /// Only this pool.
+        #[arg(long)]
+        pool: Option<String>,
+        /// Print what would be built instead of building it.
+        #[arg(long)]
+        dry_run: bool,
+        /// Rebuild even if the image is up to date, without the build cache.
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 #[derive(Args)]

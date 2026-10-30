@@ -8,6 +8,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::process::ExitStatus;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Result, anyhow};
 use tokio::process::Child;
@@ -29,6 +30,38 @@ pub enum Backend {
     #[cfg(test)]
     #[cfg_attr(not(unix), allow(dead_code))]
     Fake(fake::FakeBackend),
+}
+
+/// What a probe printed, and how it ended. `code` is `None` when it was killed.
+#[derive(Debug, Clone, Default)]
+pub struct ProbeOutput {
+    pub stdout: String,
+    pub stderr: String,
+    pub code: Option<i32>,
+}
+
+/// An image as the container CLI reports it.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ImageInfo {
+    pub id: String,
+    /// The image's default user (`runner`); empty or `None` means root.
+    pub user: Option<String>,
+    pub labels: HashMap<String, String>,
+}
+
+/// Most a probe may print before the rest is dropped.
+const PROBE_OUTPUT_LIMIT: usize = 256 * 1024;
+
+pub(crate) fn probe_output(out: std::process::Output) -> ProbeOutput {
+    let clip = |bytes: &[u8]| {
+        let bytes = &bytes[..bytes.len().min(PROBE_OUTPUT_LIMIT)];
+        String::from_utf8_lossy(bytes).into_owned()
+    };
+    ProbeOutput {
+        stdout: clip(&out.stdout),
+        stderr: clip(&out.stderr),
+        code: out.status.code(),
+    }
 }
 
 /// A launched runner. When `job` exits, the runner has finished (or failed) its single job.
@@ -165,6 +198,49 @@ impl Backend {
             Backend::Tart(b) => b.list(prefix).await,
             #[cfg(test)]
             Backend::Fake(b) => b.list(prefix).await,
+        }
+    }
+
+    /// Runs `script` (POSIX shell) once in a throwaway worker the way a job would be run, as the
+    /// runner user, and returns what it printed. The worker is named `name`, so `cleanup(name)`
+    /// removes it however the probe ended. With `start_docker`, a container backend starts the
+    /// pool's in-job Docker daemon first.
+    pub async fn probe(
+        &self,
+        name: &str,
+        script: &str,
+        start_docker: bool,
+        timeout: Duration,
+    ) -> Result<ProbeOutput> {
+        match self {
+            Backend::Host(b) => b.probe(script, timeout).await,
+            Backend::Oci(b) => b.probe(name, script, start_docker, timeout).await,
+            Backend::Tart(b) => b.probe(name, script, timeout).await,
+            #[cfg(test)]
+            Backend::Fake(b) => b.probe(name).await,
+        }
+    }
+
+    /// The image `reference` as stored locally, or `None` if it isn't there. Only container
+    /// backends have images.
+    pub async fn image_info(&self, reference: &str) -> Result<Option<ImageInfo>> {
+        match self {
+            Backend::Oci(b) => b.image_info(reference).await,
+            _ => Ok(None),
+        }
+    }
+
+    /// Builds `dockerfile` into the image `tag`, using `dir` for the build files.
+    pub async fn build_image(
+        &self,
+        tag: &str,
+        dockerfile: &str,
+        dir: &Path,
+        no_cache: bool,
+    ) -> Result<()> {
+        match self {
+            Backend::Oci(b) => b.build_image(tag, dockerfile, dir, no_cache).await,
+            _ => Err(anyhow!("only container pools can build an image")),
         }
     }
 

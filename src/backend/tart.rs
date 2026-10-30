@@ -8,7 +8,7 @@ use serde_json::Value;
 use tokio::process::Command;
 use tracing::info;
 
-use super::Running;
+use super::{ProbeOutput, Running, probe_output};
 use crate::config::TartConfig;
 use crate::hooks;
 use crate::paths::expand_home;
@@ -60,39 +60,7 @@ impl TartBackend {
         jit_config: &str,
         hook_env: &[(String, String)],
     ) -> Result<Running> {
-        output("tart", &["clone", &self.cfg.image, name]).await?;
-        let mut set = vec!["set".to_string(), name.into()];
-        if let Some(cpus) = self.cfg.cpus {
-            set.extend(["--cpu".into(), cpus.to_string()]);
-        }
-        if let Some(memory) = self.cfg.memory_mb {
-            set.extend(["--memory".into(), memory.to_string()]);
-        }
-        if set.len() > 2 {
-            output("tart", &set).await?;
-        }
-
-        let mut run = vec!["run".to_string(), name.into(), "--no-graphics".into()];
-        if let Some(size) = &self.cfg.cache_size {
-            let disk = self.cache_disk(name, size)?;
-            run.push(format!("--disk={}", disk.display()));
-        }
-        let mut vm = Command::new("tart")
-            .args(&run)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true)
-            .spawn()
-            .map_err(|e| proc::spawn_error("tart", e))?;
-        pipe_output(&mut vm, &format!("{name}/vm"));
-
-        let ip_args = ["ip", name, "--wait", "180"];
-        let ip = tokio::select! {
-            ip = output("tart", &ip_args) => ip?,
-            status = vm.wait() => bail!("VM exited while booting ({status:?})"),
-        };
-        self.wait_for_ssh(&ip).await?;
+        let (vm, ip) = self.boot(name, true).await?;
         // The hooks call `home-runner cpu-sample` inside the VM to read macOS CPU counters.
         self.copy_self(&ip).await?;
 
@@ -115,6 +83,68 @@ impl TartBackend {
             .map_err(|e| proc::spawn_error("ssh", e))?;
         let watch = pipe_output(&mut job, name);
         Ok(Running::new(job, Some(vm), false, watch))
+    }
+
+    /// Clones the image into a VM called `name`, boots it and waits until SSH answers. The cache
+    /// disk is only attached for jobs.
+    async fn boot(&self, name: &str, cache: bool) -> Result<(tokio::process::Child, String)> {
+        output("tart", &["clone", &self.cfg.image, name]).await?;
+        let mut set = vec!["set".to_string(), name.into()];
+        if let Some(cpus) = self.cfg.cpus {
+            set.extend(["--cpu".into(), cpus.to_string()]);
+        }
+        if let Some(memory) = self.cfg.memory_mb {
+            set.extend(["--memory".into(), memory.to_string()]);
+        }
+        if set.len() > 2 {
+            output("tart", &set).await?;
+        }
+
+        let mut run = vec!["run".to_string(), name.into(), "--no-graphics".into()];
+        if let (true, Some(size)) = (cache, &self.cfg.cache_size) {
+            let disk = self.cache_disk(name, size)?;
+            run.push(format!("--disk={}", disk.display()));
+        }
+        let mut vm = Command::new("tart")
+            .args(&run)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .map_err(|e| proc::spawn_error("tart", e))?;
+        pipe_output(&mut vm, &format!("{name}/vm"));
+
+        let ip_args = ["ip", name, "--wait", "180"];
+        let ip = tokio::select! {
+            ip = output("tart", &ip_args) => ip?,
+            status = vm.wait() => bail!("VM exited while booting ({status:?})"),
+        };
+        self.wait_for_ssh(&ip).await?;
+        Ok((vm, ip))
+    }
+
+    /// Boots a throwaway clone and runs `script` in it over SSH as the runner user. Needs one of
+    /// the two macOS VM slots, so stop other macOS VMs first if both are in use.
+    pub async fn probe(&self, name: &str, script: &str, timeout: Duration) -> Result<ProbeOutput> {
+        let run = async {
+            let (_vm, ip) = self.boot(name, false).await?;
+            let out = self
+                .ssh(&ip)
+                .arg(format!("/bin/sh -c {}", sh_quote(script)))
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .kill_on_drop(true)
+                .output()
+                .await
+                .map_err(|e| proc::spawn_error("ssh", e))?;
+            Ok(probe_output(out))
+        };
+        match tokio::time::timeout(timeout, run).await {
+            Ok(result) => result,
+            Err(_) => bail!("the probe did not finish within {}s", timeout.as_secs()),
+        }
     }
 
     /// Creates the slot's cache disk the first time it's needed, as a sparse file that only takes
@@ -171,7 +201,7 @@ impl TartBackend {
     }
 
     pub async fn check(&self) -> Result<String> {
-        let version = output("tart", &["--version"]).await?;
+        let version = output("tart", &["--version"]).await.map_err(missing_tart)?;
         if self.cfg.ssh_password.is_some() {
             output("sshpass", &["-V"])
                 .await
@@ -204,7 +234,9 @@ impl TartBackend {
     }
 
     async fn vm_names(&self) -> Result<Vec<String>> {
-        let json = output("tart", &["list", "--format", "json"]).await?;
+        let json = output("tart", &["list", "--format", "json"])
+            .await
+            .map_err(missing_tart)?;
         let entries: Vec<Value> =
             serde_json::from_str(&json).context("parsing `tart list` output")?;
         Ok(entries
@@ -366,6 +398,21 @@ exit $rc"#,
     )
 }
 
+/// Tart moved from Cirrus Labs to github.com/openai/tart. The `cirruslabs/cli` Homebrew tap stopped
+/// being updated and no longer installs on current Homebrew (it fails on `depends_on macos:`), so
+/// point at what does work.
+const TART_INSTALL: &str = "tart is not installed. Install it with `brew install openai/tools/tart` \
+    (the old `brew install cirruslabs/cli/tart` fails on current Homebrew), or download tart.tar.gz \
+    from https://github.com/openai/tart/releases and put its `tart.app/Contents/MacOS/tart` on PATH";
+
+fn missing_tart(e: anyhow::Error) -> anyhow::Error {
+    if e.to_string().contains("not found on PATH") {
+        anyhow::anyhow!(TART_INSTALL)
+    } else {
+        e
+    }
+}
+
 /// Parses sizes like "100G", "512M" or "1T" (powers of 1024; a trailing "B" or "iB" is fine).
 fn parse_size(size: &str) -> Result<u64> {
     let s = size.trim().to_ascii_uppercase();
@@ -394,6 +441,17 @@ fn sh_quote(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_missing_tart_says_how_to_install_it() {
+        let missing = missing_tart(anyhow::anyhow!("`tart` was not found on PATH"));
+        let text = missing.to_string();
+        assert!(text.contains("brew install openai/tools/tart"), "{text}");
+        assert!(text.contains("releases"));
+        // Other failures pass through untouched.
+        let other = missing_tart(anyhow::anyhow!("`tart list` failed (exit status: 1): boom"));
+        assert!(other.to_string().contains("boom"));
+    }
 
     #[test]
     fn parses_sizes() {

@@ -60,6 +60,12 @@ pub async fn run(path: &Path, strict: bool) -> Result<()> {
             }
         }
         println!("    runs-on: [{}]", pool.labels.join(", "));
+        // A pool that can't be checked here (backend failed above) can't be probed either.
+        if (failures == 0 || pool.backend.check().await.is_ok())
+            && let Some(false) = crate::prereq::run::doctor(&config, pool).await
+        {
+            failures += 1;
+        }
         let compare: Vec<_> = [pool.pricing.github, pool.pricing.depot]
             .into_iter()
             .flatten()
@@ -163,6 +169,19 @@ pub fn audit_pool(pool: &PoolConfig, group: Option<&RunnerGroup>) -> Vec<String>
                 group.name
             ));
         }
+    }
+
+    if let BackendConfig::AppleContainer(c) | BackendConfig::Docker(c) = &pool.backend
+        && c.extra_args
+            .iter()
+            .any(|a| a.contains("docker.sock") || a.contains("containerd.sock"))
+    {
+        out.push(
+            "extra_args mounts a Docker socket into every job. That gives repository code control \
+             of the daemon that socket belongs to (on the host, root on this machine). Use \
+             `docker_in_job = true`, which gives each job its own daemon inside its own VM"
+                .into(),
+        );
     }
 
     match &pool.backend {
@@ -297,6 +316,17 @@ mod tests {
         // Apple container VMs are their own VMs; the extra capabilities stay inside.
         let a = pool("backend = \"apple-container\"\ndocker_in_job = true");
         assert!(audit_pool(&a, None).is_empty());
+    }
+
+    #[test]
+    fn flags_a_docker_socket_mounted_into_jobs() {
+        let p = pool(
+            "backend = \"docker\"\nextra_args = [\"-v\", \"/var/run/docker.sock:/var/run/docker.sock\"]",
+        );
+        let warnings = audit_pool(&p, None);
+        assert_eq!(warnings.len(), 1, "{warnings:#?}");
+        assert!(warnings[0].contains("Docker socket"));
+        assert!(audit_pool(&pool("backend = \"docker\""), None).is_empty());
     }
 
     #[cfg(unix)]

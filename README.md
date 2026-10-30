@@ -56,7 +56,7 @@ Or build it yourself with `cargo build --release`.
 ### Apple Silicon Mac
 
 ```sh
-brew install cirruslabs/cli/tart          # macOS jobs
+brew install openai/tools/tart            # macOS jobs (see the note below)
 # Apple container: install the signed .pkg from github.com/apple/container/releases, then:
 container system start                    # once, interactively (installs the Linux kernel)
 brew install hudochenkov/sshpass/sshpass  # only if you use ssh_password with Tart
@@ -75,6 +75,8 @@ Then, in **System Settings**:
 home-runner keeps the Mac awake itself (`prevent_sleep`).
 
 Pre-pull the macOS image before the first job (about 30–60 GB): `tart pull ghcr.io/cirruslabs/macos-sequoia-xcode:latest`.
+
+**Tart won't install with `brew install cirruslabs/cli/tart`?** Tart now lives at [github.com/openai/tart](https://github.com/openai/tart), and the `cirruslabs/cli` Homebrew tap stopped being updated. On current Homebrew its formula fails with ``Calling `depends_on :macos` with `depends_on macos:` is disabled!``. Install from the maintained tap instead (`brew install openai/tools/tart`), or download `tart.tar.gz` from the [releases page](https://github.com/openai/tart/releases) and put `tart.app/Contents/MacOS/tart` on your `PATH`. If you installed the old tap, `brew untap cirruslabs/cli` first so `brew install tart` isn't ambiguous. `home-runner doctor` prints this when it can't find `tart`. The Cirrus Labs VM *images* (`ghcr.io/cirruslabs/macos-*`) are unaffected.
 
 ### Intel Mac
 
@@ -164,6 +166,72 @@ Each job starts its own `dockerd` before the runner and stops it afterwards. Wit
 - A timeout or shutdown kills the VM without stopping `dockerd` first. It recovers on the next start.
 
 Anything a job leaves in `/cache` is visible to the next job on that slot, so give a cached pool a runner group limited to repos you trust. `runner_group_id` on a pool overrides `github.runner_group_id`. Rebuild the image to pick up new versions.
+
+### Job prerequisites: tools, browsers and Docker, verified before a pool takes jobs
+
+Installing machine tools in every CI job is slow and flaky, and a worker that lacks a tool should not be handed jobs that will fail. A **profile** declares what a worker must have; a pool that sets `profile` is checked **inside a real worker, as the runner user**, and no runner is registered for it until the check passes. The check never looks at the Mac that supervises the pools.
+
+```toml
+[[profile]]
+name = "with-tap"
+version = 1                       # bump it to invalidate readiness everywhere the profile is used
+# auto_install = true             # build/repair on startup instead of waiting for `prereq install`
+
+[[profile.require]]               # an executable on PATH, optionally pinned
+kind = "command"
+name = "node"
+version = "26"                    # "26" matches 26.x.y; "1.7.12" matches only 1.7.12(.x)
+
+[[profile.require]]
+kind = "command"
+name = "actionlint"
+version = "1.7.12"
+# Run as root while building the image. It comes from this file and nowhere else.
+install = """
+curl -fsSL https://github.com/rhysd/actionlint/releases/download/v1.7.12/actionlint_1.7.12_linux_arm64.tar.gz \
+  | tar -xz -C /usr/local/bin actionlint
+"""
+
+[[profile.require]]
+kind = "apt"
+packages = ["libasound2-dev", "pkg-config"]
+
+[[profile.require]]
+kind = "docker"                   # a usable daemon: needs docker_in_job = true on container pools
+
+[[profile.require]]
+kind = "playwright"
+versions = ["1.56.1", "1.49.0"]   # exact versions, one per workspace that pins its own
+
+[[pool]]
+name = "ubuntu-latest"
+backend = "apple-container"
+image = "home-runner/ubuntu-latest:arm64"
+pull = false
+docker_in_job = true
+profile = "with-tap"
+```
+
+```sh
+home-runner prereq inspect                  # probe a throwaway worker of each pool, list what's missing and how to fix it
+home-runner prereq install --pool ubuntu-latest   # build what's missing into a derived image, then verify (alias: repair)
+home-runner prereq install --dry-run        # show the Dockerfile and install script without building
+```
+
+`home-runner doctor` and `home-runner selftest` run the same check, and `home-runner status` shows a pool that isn't ready as a failing slot with the reason. A failing pool keeps retrying with the usual backoff and starts taking jobs on its own once the worker is fixed. It is never advertised to GitHub while unready, so jobs for it wait in the queue instead of failing.
+
+**How it works**
+
+- *Container pools* (`apple-container`, `docker`): `prereq install` builds an image `home-runner/prereq-<pool>-<profile>:<fingerprint>` from the pool's `image` and the pool then runs jobs in it. Installing happens once, as root, from your config (apt packages, the Playwright recipe and `install` scripts on `command` requirements); a repository's workflow never supplies a script. Jobs get an immutable copy, so one job can't change the next job's tools. Repeating `install` does nothing when the image is current. It is rebuilt when the profile changes (name, version or any requirement) or when the base image is rebuilt, which is also what makes `inspect` report the pool as not ready after an image rebuild.
+- *Tart and host pools*: the app **verifies only**. Put the requirements on the golden image (`images/macos-latest/provision.sh`) or the machine yourself; `inspect` lists exactly what is missing. This is also how to use `install = "preinstalled"` on a container pool whose image already has everything. A Tart probe boots a throwaway clone, so it needs a free macOS VM slot (stop other macOS VMs first if two are running). Windows host pools can't use profiles (the probe is a POSIX shell script).
+- Readiness is remembered until the profile or the image changes and checked again on every restart. The probe runs as the image's default user; a worker that runs as root fails, since the runner refuses to.
+- The probe worker is named like the pool's other workers, so it's removed on failure, cancellation or a crash (reconcile cleans up whatever is left).
+
+**Docker workloads** (`kind = "docker"`). The probe starts the pool's own in-job daemon exactly as a job would, then, one step at a time: the daemon answers as the runner user; the PostgreSQL image (`image = "postgres:17-alpine"`) pulls and has the worker's architecture; a disposable container starts; a command runs inside it (`docker exec`); `pg_isready` answers on TCP (not the socket, which answers during the image's first-boot server); `psql` connects and runs `select 1`; the published port is reachable **from the job environment** (a real PostgreSQL protocol handshake, not just an open port); and the container is removed. It stops at the first step that fails and reports that step's own error plus bounded, scrubbed diagnostics (container state, exit reason, the last log lines and the daemon's log; the fixture password and `password=`/`token=` values are redacted). It reports `unsupported platform` explicitly when an image has no build for the worker's architecture. If `DOCKER_HOST` points at a remote or nested daemon, published ports live on that daemon's host: the probe uses its address (or `endpoint_host`) and says so. The app never mounts a Docker socket into a job: `doctor` warns if `extra_args` does.
+
+**Playwright** (`kind = "playwright"`). Each pinned `playwright-core` version is installed under `/opt/home-runner/playwright/runtime/<version>` and its exact Chromium and headless-shell revisions, with their OS libraries (`--with-deps`), under `/opt/home-runner/playwright/<os>-<arch>/browsers`, all root-owned and read-only, so versions with different revisions coexist and nothing a job does can change them. Jobs get `PLAYWRIGHT_BROWSERS_PATH` pointing at that folder, so a project's own Playwright finds the revision it needs without `playwright install` in CI. The probe launches each version's browser headless as the runner user, opens a page, reads a computed style and closes it, and tells a missing revision from missing libraries, a wrong architecture and a permissions problem. Native arm64 and amd64 images are supported; the folder is keyed by OS and architecture, and a worker of a different architecture than the pool declares fails before any browser runs.
+
+Without `install` access (Tart, host, or `install = "preinstalled"`): install `playwright-core@<version>` under `<root>/runtime/<version>` and run its `cli.js install --with-deps chromium` with `PLAYWRIGHT_BROWSERS_PATH=<root>/<os>-<arch>/browsers` set, as root, then make the tree read-only for everyone else.
 
 ### A `macos-latest`-like Tart image with warm caches
 
@@ -320,9 +388,10 @@ You'd only need inbound access for webhook-driven scale-to-zero, which this desi
 | `home-runner status` | What each slot is doing, this machine's runners as GitHub sees them, and lifetime savings; `--json` for scripts |
 | `home-runner drain` / `resume` | Stop taking jobs for maintenance (`drain --wait` waits for running jobs), and start again |
 | `home-runner selftest` | Brings up a runner per pool, checks GitHub sees it, and checks teardown leaves nothing behind |
+| `home-runner prereq inspect` / `install` | Check a pool's job prerequisites in a real worker; build what's missing (see above) |
 | `home-runner jobs` / `savings` | Job log and savings report (see above) |
 | `home-runner ui` | Dashboard of savings and job stats (see above) |
-| `home-runner doctor` | Checks auth, tooling and images, warns about weak isolation, and prints labels |
+| `home-runner doctor` | Checks auth, tooling, images and job prerequisites, warns about weak isolation, and prints labels |
 | Logs | `~/.home-runner/logs/` or `C:\ProgramData\home-runner\logs\`, rotated daily, kept 14 days. Runner output is included. |
 | `HOME_RUNNER_LOG=debug` | More detail |
 | `home-runner cleanup` | Removes everything this machine registered or created (stop the service first) |
@@ -349,7 +418,8 @@ Idle containers and VMs use little CPU, but a Tart VM reserves its memory while 
 
 ## Known limitations and next steps
 
-- **Docker inside Linux jobs:** set `docker_in_job = true` and use an image with `dockerd` (see above). The stock `ghcr.io/actions/actions-runner` image doesn't include one.
+- **Docker inside Linux jobs:** set `docker_in_job = true` and use an image with `dockerd` (see above). The stock `ghcr.io/actions/actions-runner` image doesn't include one. Add a `docker` requirement to a profile to have the app prove it works.
+- **Prerequisite installs:** the app builds them into images for container pools only; Tart and host pools are verified, not installed (see "Job prerequisites").
 - **Self-test doesn't run a job.** It proves the runner registers, connects and cleans up; see `selftest`.
 - **Tart golden images:** for speed and reliability, clone the Cirrus Labs image once, install your toolchains, the runner (in `~/actions-runner`) and an SSH key, then point `image` at that local VM and use `ssh_key`.
 - **Intel macOS and Windows jobs** run on the host, not in a VM. Adding a QEMU backend for Windows VMs on Intel Macs would follow the same `Backend` pattern (`src/backend/`).

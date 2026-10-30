@@ -75,7 +75,7 @@ arch = "amd64"
 cpus = 4
 memory = "8G"
 
-# macOS jobs in a throwaway Tart VM (`brew install cirruslabs/cli/tart`).
+# macOS jobs in a throwaway Tart VM (`brew install openai/tools/tart`).
 [[pool]]
 name = "macos"
 backend = "tart"

@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 use anyhow::{Result, bail};
 use tokio::process::Command;
 
-use super::Running;
+use super::{ProbeOutput, Running};
 use crate::proc::{self, pipe_output};
 
 #[derive(Default)]
@@ -20,6 +20,11 @@ pub struct FakeState {
     pub cleaned: Vec<String>,
     /// The next n launches fail.
     pub launch_failures: u32,
+    /// What probes print, and the names they ran under.
+    pub probe_output: ProbeOutput,
+    pub probed: Vec<String>,
+    /// The next n probes fail to run at all.
+    pub probe_failures: u32,
 }
 
 pub struct FakeBackend {
@@ -52,6 +57,17 @@ impl FakeBackend {
             .map_err(|e| proc::spawn_error("sh", e))?;
         let watch = pipe_output(&mut child, name);
         Ok(Running::new(child, None, false, watch))
+    }
+
+    pub async fn probe(&self, name: &str) -> Result<ProbeOutput> {
+        let mut state = self.state.lock().unwrap();
+        state.resources.push(name.to_string());
+        state.probed.push(name.to_string());
+        if state.probe_failures > 0 {
+            state.probe_failures -= 1;
+            bail!("fake probe failure");
+        }
+        Ok(state.probe_output.clone())
     }
 
     pub async fn cleanup(&self, name: &str) -> Result<()> {

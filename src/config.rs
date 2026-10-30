@@ -5,6 +5,7 @@ use anyhow::{Context, Result, bail, ensure};
 use serde::Deserialize;
 
 use crate::paths;
+use crate::prereq::ProfileConfig;
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -16,6 +17,9 @@ pub struct Config {
     pub pricing: PricingConfig,
     #[serde(default)]
     pub alerts: AlertsConfig,
+    /// Versioned sets of job prerequisites that pools can require. See `prereq`.
+    #[serde(default, rename = "profile")]
+    pub profiles: Vec<ProfileConfig>,
     #[serde(default, rename = "pool")]
     pub pools: Vec<PoolConfig>,
 }
@@ -153,6 +157,8 @@ pub struct PoolConfig {
     /// Org runner group for this pool, overriding `github.runner_group_id`. Lets a pool with a
     /// broad label (like `ubuntu-latest`) serve only the repos that group allows.
     pub runner_group_id: Option<u64>,
+    /// A `[[profile]]` whose requirements a worker must meet before this pool takes jobs.
+    pub profile: Option<String>,
     /// Hard limit on a single job, measured from when the job starts.
     #[serde(default = "default_job_timeout")]
     pub job_timeout_minutes: u64,
@@ -306,6 +312,15 @@ impl Config {
         self.github.scope()?;
         ensure!(!self.pools.is_empty(), "config has no [[pool]] entries");
         let apple_silicon = cfg!(all(target_os = "macos", target_arch = "aarch64"));
+        let mut profile_names = HashSet::new();
+        for profile in &self.profiles {
+            profile.validate()?;
+            ensure!(
+                profile_names.insert(&profile.name),
+                "duplicate profile name {:?}",
+                profile.name
+            );
+        }
         let mut names = HashSet::new();
         let mut macos_vms = 0;
         for pool in &self.pools {
@@ -337,6 +352,32 @@ impl Config {
                     pool.backend.kind()
                 ),
                 BackendConfig::Host(_) | BackendConfig::Docker(_) => {}
+            }
+            if let Some(name) = &pool.profile {
+                let profile = self.profiles.iter().find(|p| &p.name == name);
+                ensure!(
+                    profile.is_some(),
+                    "pool {:?}: profile {name:?} is not defined (add a [[profile]] named {name:?})",
+                    pool.name
+                );
+                ensure!(
+                    cfg!(unix) || !matches!(pool.backend, BackendConfig::Host(_)),
+                    "pool {:?}: prerequisite probes need a POSIX shell, so a profile can't be used \
+                     on a Windows host pool",
+                    pool.name
+                );
+                if let (
+                    Some(profile),
+                    BackendConfig::AppleContainer(c) | BackendConfig::Docker(c),
+                ) = (profile, &pool.backend)
+                {
+                    ensure!(
+                        profile.docker().is_none() || c.docker_in_job,
+                        "pool {:?}: profile {name:?} needs a Docker daemon, so set docker_in_job = true \
+                         on the pool and use an image with dockerd",
+                        pool.name
+                    );
+                }
             }
             for (id, provider) in [
                 (&pool.compare_github, crate::pricing::Provider::GitHub),
@@ -442,6 +483,23 @@ mod tests {
         }
     }
 
+    #[test]
+    fn the_readme_profile_example_is_valid() {
+        let readme = include_str!("../README.md");
+        let block = readme
+            .split("```toml\n")
+            .skip(1)
+            .filter_map(|b| b.split("```").next())
+            .find(|b| b.contains("[[profile]]"))
+            .expect("the README documents a profile");
+        let text =
+            format!("[github]\norg = \"o\"\n[github.auth]\ntype = \"token\"\nenv = \"X\"\n{block}");
+        let config: Config = toml::from_str(&text).unwrap();
+        config.validate().unwrap();
+        assert_eq!(config.profiles[0].requirements.len(), 5);
+        assert_eq!(config.pools[0].profile.as_deref(), Some("with-tap"));
+    }
+
     fn parse(extra: &str) -> Result<Config> {
         let text = format!(
             "[github]\norg = \"o\"\n[github.auth]\ntype = \"token\"\nenv = \"X\"\n{extra}\n\
@@ -464,6 +522,28 @@ mod tests {
             BackendConfig::Docker(oci) => assert!(oci.docker_in_job),
             other => panic!("unexpected backend {other:?}"),
         }
+    }
+
+    #[test]
+    fn pools_must_name_a_defined_profile_and_docker_profiles_need_docker_in_job() {
+        let with = |profile: &str, pool: &str| {
+            let text = format!(
+                "[github]\norg = \"o\"\n[github.auth]\ntype = \"token\"\nenv = \"X\"\n\
+                 {profile}\n[[pool]]\nname = \"p\"\nbackend = \"docker\"\n{pool}\n"
+            );
+            let config: Config = toml::from_str(&text).unwrap();
+            config.validate()
+        };
+        let node = "[[profile]]\nname = \"web\"\n[[profile.require]]\nkind = \"command\"\nname = \"node\"\n";
+        let docker = "[[profile]]\nname = \"web\"\n[[profile.require]]\nkind = \"docker\"\n";
+        assert!(with(node, "profile = \"web\"").is_ok());
+        let err = with(node, "profile = \"nope\"").unwrap_err().to_string();
+        assert!(err.contains("not defined"), "{err}");
+        let err = with(docker, "profile = \"web\"").unwrap_err().to_string();
+        assert!(err.contains("docker_in_job"), "{err}");
+        assert!(with(docker, "profile = \"web\"\ndocker_in_job = true").is_ok());
+        let err = with(&format!("{node}{node}"), "").unwrap_err().to_string();
+        assert!(err.contains("duplicate profile"), "{err}");
     }
 
     #[test]
