@@ -7,9 +7,11 @@ use eframe::egui::{self, Align, Layout, RichText, Sense, Ui, Vec2};
 
 use super::active::{typical_durations, vs_usual, what};
 use super::data::Snapshot;
-use super::widgets::{self, BAD, MUTED, OK, SUBTLE};
+use super::widgets::{self, BAD, MUTED, OK, RUNNING, SUBTLE};
 use super::{App, Scope};
+use crate::health::{PoolState, SlotState};
 use crate::ledger::JobRecord;
+use crate::live::LiveJob;
 use crate::timefmt;
 
 /// Rows drawn at most; the rest are reachable by filtering.
@@ -60,6 +62,10 @@ struct Row<'a> {
 }
 
 impl Row<'_> {
+    fn running(&self) -> bool {
+        self.r.result == RUNNING
+    }
+
     fn key(&self) -> String {
         format!("{}/{}", self.r.host, self.r.id)
     }
@@ -95,7 +101,8 @@ impl Row<'_> {
     }
 }
 
-const RESULTS: [(&str, &str); 4] = [
+const RESULTS: [(&str, &str); 5] = [
+    (RUNNING, "Running"),
     ("Succeeded", "Succeeded"),
     ("Failed", "Failed or timed out"),
     ("Canceled", "Canceled"),
@@ -110,24 +117,100 @@ fn result_matches(filter: Option<&str>, result: &str) -> bool {
     }
 }
 
+/// A running job shaped like a finished record, so it sits in the same table with the status
+/// "Running" and a duration that is still growing.
+fn live_record(
+    host: &str,
+    pool: &PoolState,
+    slot: &SlotState,
+    job: &LiveJob,
+    now: i64,
+) -> JobRecord {
+    JobRecord {
+        id: job
+            .name
+            .clone()
+            .unwrap_or_else(|| format!("{}-{}", pool.name, slot.slot)),
+        host: host.into(),
+        pool: pool.name.clone(),
+        backend: pool.backend.clone(),
+        os: pool.os.clone(),
+        arch: pool.arch.clone(),
+        cpus: pool.cpus,
+        repo: job.repo.clone(),
+        workflow: job.workflow.clone(),
+        url: job.url.clone(),
+        actor: job.actor.clone(),
+        event: job.event.clone(),
+        git_ref: job.git_ref.clone(),
+        sha: job.sha.clone(),
+        started_at: job.started_at,
+        finished_at: now,
+        duration_secs: (now - job.started_at).max(0) as f64,
+        result: RUNNING.into(),
+        cpu_utilization: job.cpu.last().map(|c| f64::from(*c)),
+        ..Default::default()
+    }
+}
+
+/// Jobs running now with the house they run in (fleet scope only).
+fn running_records(snap: &Snapshot, scope: Scope) -> Vec<(JobRecord, Option<String>)> {
+    let now = timefmt::now();
+    let mut out = Vec::new();
+    match scope {
+        Scope::Host => {
+            if let Some(state) = snap.state.as_ref().filter(|_| snap.daemon_running()) {
+                for pool in state.pools() {
+                    for slot in &pool.slots {
+                        if let Some(job) = &slot.job {
+                            out.push((live_record(&state.host, &pool, slot, job, now), None));
+                        }
+                    }
+                }
+            }
+        }
+        Scope::Fleet => {
+            if let Some(view) = &snap.fleet {
+                for house in &view.houses {
+                    for host in house.hosts.iter().filter(|h| h.online) {
+                        for pool in &host.pools {
+                            for slot in &pool.slots {
+                                if let Some(job) = &slot.job {
+                                    let record = live_record(&host.host, pool, slot, job, now);
+                                    out.push((record, Some(house.house.clone())));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
 pub fn show(ui: &mut Ui, app: &mut App, snap: &Snapshot) {
     let scope = app.scope;
     let h = &mut app.history;
-    let all: Vec<Row> = match scope {
+    let live = running_records(snap, scope);
+    let mut all: Vec<Row> = match scope {
         Scope::Host => snap.ledger.iter().map(|r| Row { r, house: None }).collect(),
-        Scope::Fleet => {
-            let mut rows: Vec<Row> = snap
-                .fleet_jobs
-                .iter()
-                .map(|j| Row {
-                    r: &j.record,
-                    house: Some(&j.house),
-                })
-                .collect();
-            rows.sort_by_key(|r| r.r.started_at);
-            rows
-        }
+        Scope::Fleet => snap
+            .fleet_jobs
+            .iter()
+            .map(|j| Row {
+                r: &j.record,
+                house: Some(&j.house),
+            })
+            .collect(),
     };
+    all.extend(live.iter().map(|(r, house)| Row {
+        r,
+        house: house.as_deref(),
+    }));
+    if scope == Scope::Fleet {
+        all.sort_by_key(|r| r.r.started_at);
+    }
     let needle = h.search.trim().to_lowercase();
     // Everything but the period applies to the chart, which always shows 14 days.
     let filtered: Vec<&Row> = all
@@ -140,10 +223,12 @@ pub fn show(ui: &mut Ui, app: &mut App, snap: &Snapshot) {
     let rows: Vec<&Row> = filtered
         .iter()
         .copied()
-        .filter(|r| since.is_none_or(|s| r.r.started_at >= s))
+        .filter(|r| r.running() || since.is_none_or(|s| r.r.started_at >= s))
         .collect();
+    // A job that hasn't finished has no result, cost or saving yet.
+    let finished: Vec<&Row> = rows.iter().copied().filter(|r| !r.running()).collect();
 
-    kpis(ui, &rows, h.period);
+    kpis(ui, &finished, h.period);
 
     widgets::section(
         ui,
@@ -203,7 +288,7 @@ pub fn show(ui: &mut Ui, app: &mut App, snap: &Snapshot) {
                 }
             });
         if ui.button("Export CSV").clicked() {
-            let records: Vec<JobRecord> = rows.iter().map(|r| r.r.clone()).collect();
+            let records: Vec<JobRecord> = finished.iter().map(|r| r.r.clone()).collect();
             exported = Some(export(&records));
         }
     });
@@ -366,6 +451,9 @@ fn table(ui: &mut Ui, h: &mut HistoryUi, snap: &Snapshot, scope: Scope, rows: &[
                         .on_hover_text(format!("{} UTC", timefmt::short(r.started_at)));
                 });
                 cell(ui, widths[5], true, |ui| {
+                    if row.running() {
+                        widgets::keep_ticking(ui.ctx());
+                    }
                     ui.label(widgets::dur(r.duration_secs));
                 });
                 cell(ui, widths[6], true, |ui| {
@@ -488,9 +576,13 @@ fn details(ui: &mut Ui, r: &JobRecord, typical: &BTreeMap<String, f64>) {
                 item(
                     ui,
                     "Your cost",
-                    widgets::usd(r.electricity_usd + r.self_hosted_fee_usd),
+                    if r.result == RUNNING {
+                        "-".into()
+                    } else {
+                        widgets::usd(r.electricity_usd + r.self_hosted_fee_usd)
+                    },
                 );
-                let usual = vs_usual(typical, r);
+                let usual = vs_usual(typical, r).filter(|_| r.result != RUNNING);
                 ui.vertical(|ui| {
                     ui.label(RichText::new("vs its usual run").size(11.0).color(MUTED));
                     match usual {
@@ -502,6 +594,9 @@ fn details(ui: &mut Ui, r: &JobRecord, typical: &BTreeMap<String, f64>) {
                         }
                         Some(_) => {
                             ui.label("about usual");
+                        }
+                        None if r.result == RUNNING => {
+                            ui.label(RichText::new("still running").color(MUTED));
                         }
                         None => {
                             ui.label(RichText::new("not enough runs").color(MUTED));
@@ -550,6 +645,67 @@ fn export(records: &[JobRecord]) -> anyhow::Result<std::path::PathBuf> {
 mod tests {
     use super::*;
     use eframe::egui::{Event, PointerButton, Pos2, RawInput, Rect, vec2};
+
+    #[test]
+    fn a_running_job_is_listed_as_running() {
+        use crate::health::{Phase, State};
+        let now = timefmt::now();
+        let state = State {
+            host: "studio".into(),
+            updated_at: now,
+            pools: vec![PoolState {
+                name: "linux".into(),
+                backend: "apple-container".into(),
+                cpus: 4,
+                ..Default::default()
+            }],
+            slots: vec![
+                SlotState {
+                    pool: "linux".into(),
+                    slot: 0,
+                    phase: Phase::Busy,
+                    job: Some(LiveJob {
+                        name: Some("hr-studio-linux-0".into()),
+                        repo: Some("acme/app".into()),
+                        started_at: now - 90,
+                        cpu: vec![0.2, 0.5],
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+                SlotState {
+                    pool: "linux".into(),
+                    slot: 1,
+                    phase: Phase::Idle,
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let snap = Snapshot {
+            state: Some(state),
+            ..Default::default()
+        };
+        let running = running_records(&snap, Scope::Host);
+        assert_eq!(running.len(), 1);
+        let (r, house) = &running[0];
+        assert_eq!((r.result.as_str(), house.as_deref()), (RUNNING, None));
+        assert_eq!((r.host.as_str(), r.pool.as_str()), ("studio", "linux"));
+        assert_eq!(r.repo.as_deref(), Some("acme/app"));
+        assert!((90.0..95.0).contains(&r.duration_secs));
+        assert_eq!(r.cpu_utilization, Some(0.5f32 as f64));
+        assert!(result_matches(Some(RUNNING), &r.result));
+        assert!(!result_matches(Some("Failed"), &r.result));
+        // No supervisor, no running jobs.
+        let stale = Snapshot {
+            state: snap.state.clone().map(|s| State {
+                updated_at: now - 3600,
+                ..s
+            }),
+            ..Default::default()
+        };
+        assert!(running_records(&stale, Scope::Host).is_empty());
+    }
 
     #[test]
     fn clicking_a_row_opens_its_details() {

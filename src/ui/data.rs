@@ -78,8 +78,12 @@ fn run(config_path: &Path, loader: &Loader, ctx: &eframe::egui::Context) {
         .expect("building the GUI runtime");
     let mut config_seen = None;
     let mut ledger_seen = None;
+    let mut state_seen = None;
+    let mut shown_state = String::new();
     let mut last_fleet: Option<Instant> = None;
     loop {
+        // Wake the window only when it has something new to show.
+        let mut redraw = false;
         let config_changed = changed(config_path, &mut config_seen);
         if config_changed {
             let (config, error) = match Config::load(config_path) {
@@ -94,6 +98,8 @@ fn run(config_path: &Path, loader: &Loader, ctx: &eframe::egui::Context) {
             snap.config = config;
             snap.config_error = error;
             ledger_seen = None;
+            state_seen = None;
+            redraw = true;
             loader.refresh_fleet.store(true, Ordering::Relaxed);
         }
         let (data_dir, config) = {
@@ -101,15 +107,23 @@ fn run(config_path: &Path, loader: &Loader, ctx: &eframe::egui::Context) {
             (snap.data_dir.clone(), snap.config.clone())
         };
 
-        let state = health::read_state(&data_dir);
+        let state = changed(&health::state_path(&data_dir), &mut state_seen)
+            .then(|| health::read_state(&data_dir));
         let ledger_path = data_dir.join(ledger::LEDGER_FILE);
         let ledger = changed(&ledger_path, &mut ledger_seen)
             .then(|| Arc::new(ledger::load(&[ledger_path]).unwrap_or_default()));
         {
             let mut snap = loader.snapshot.lock().unwrap();
-            snap.state = state;
+            if let Some(state) = state {
+                // The supervisor rewrites its state every few seconds just to say it is alive.
+                let fingerprint = visible_state(state.as_ref());
+                redraw |= fingerprint != shown_state;
+                shown_state = fingerprint;
+                snap.state = state;
+            }
             if let Some(ledger) = ledger {
                 snap.ledger = ledger;
+                redraw = true;
             }
         }
 
@@ -117,6 +131,7 @@ fn run(config_path: &Path, loader: &Loader, ctx: &eframe::egui::Context) {
             || loader.refresh_fleet.swap(false, Ordering::Relaxed);
         if due && let Some(config) = config.filter(|c| c.fleet.is_some()) {
             last_fleet = Some(Instant::now());
+            redraw = true;
             let result = rt.block_on(async {
                 let client = fleet::Client::from_config(&config)?.expect("fleet configured");
                 let view = client.view().await?;
@@ -136,9 +151,23 @@ fn run(config_path: &Path, loader: &Loader, ctx: &eframe::egui::Context) {
                 Err(e) => snap.fleet_error = Some(format!("{e:#}")),
             }
         }
-        ctx.request_repaint();
+        if redraw {
+            ctx.request_repaint();
+        }
         std::thread::sleep(LOCAL_EVERY);
     }
+}
+
+/// What the window would draw from a state, as text to compare: everything except the two
+/// timestamps that change on every heartbeat, which show as coarse "ago" labels anyway.
+fn visible_state(state: Option<&State>) -> String {
+    let Some(state) = state else {
+        return String::new();
+    };
+    let mut state = state.clone();
+    state.updated_at = 0;
+    state.github_ok_at = 0;
+    serde_json::to_string(&state).unwrap_or_default()
 }
 
 /// Whether a file's size or modification time changed since last time (or it appeared/vanished).
@@ -151,4 +180,26 @@ fn changed(path: &Path, seen: &mut Option<Option<(u64, SystemTime)>>) -> bool {
     }
     *seen = Some(now);
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_heartbeat_is_not_a_visible_change() {
+        let mut state = State {
+            host: "studio".into(),
+            updated_at: 100,
+            github_ok_at: 100,
+            ..Default::default()
+        };
+        let before = visible_state(Some(&state));
+        state.updated_at = 105;
+        state.github_ok_at = 104;
+        assert_eq!(visible_state(Some(&state)), before);
+        state.draining = true;
+        assert_ne!(visible_state(Some(&state)), before);
+        assert_ne!(visible_state(None), before);
+    }
 }

@@ -101,7 +101,7 @@ pub fn show(ui: &mut Ui, app: &mut App, snap: &Snapshot) {
     widgets::section(
         ui,
         &format!("Running now · {}", running.len()),
-        Some("updates every second".into()),
+        (!running.is_empty()).then(|| "updates every second".into()),
     );
     if running.is_empty() {
         ui.label(RichText::new("No jobs running.").color(MUTED));
@@ -189,6 +189,7 @@ fn job_card(
 ) {
     let j = r.job;
     let elapsed = (timefmt::now() - j.started_at).max(0) as f64;
+    widgets::keep_ticking(ui.ctx());
     widgets::card(ui, |ui| {
         ui.horizontal(|ui| {
             widgets::avatar(ui, j.actor.as_deref().unwrap_or("?"));

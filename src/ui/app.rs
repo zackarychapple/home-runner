@@ -9,7 +9,7 @@ use super::stats::{self, Stats};
 use crate::ledger::{self, GroupBy, JobRecord};
 use crate::timefmt;
 
-const RELOAD_EVERY: Duration = Duration::from_secs(2);
+const RELOAD_EVERY: Duration = Duration::from_secs(5);
 /// Re-slice the time window now and then so "last 24h" keeps moving while the window is open.
 const REFRESH_WINDOW_EVERY: Duration = Duration::from_secs(60);
 

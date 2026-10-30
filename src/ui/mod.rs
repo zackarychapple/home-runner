@@ -335,7 +335,10 @@ impl eframe::App for App {
             }
         }
 
-        // Elapsed timers tick every second.
-        ctx.request_repaint_after(Duration::from_secs(1));
+        // Running jobs ask for a redraw every second (`widgets::keep_ticking`); otherwise the data
+        // thread wakes the window when something changed, and this only refreshes the "ago" labels.
+        if !widgets::minimized(&ctx) {
+            ctx.request_repaint_after(widgets::IDLE_REDRAW);
+        }
     }
 }
