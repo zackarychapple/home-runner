@@ -141,41 +141,7 @@ pub fn print_jobs(records: &[JobRecord], limit: usize, format: Format) -> Result
                 println!("{}", serde_json::to_string(r)?);
             }
         }
-        Format::Csv => {
-            println!(
-                "started,host,pool,repo,workflow,job,actor,triggering_actor,event,ref,result,duration_secs,queued_secs,cpu_seconds,cpu_utilization,github_sku,github_usd,depot_sku,depot_usd,electricity_usd,saved_vs_github_usd,saved_vs_depot_usd,url"
-            );
-            for r in shown {
-                let f = |v: Option<f64>| v.map(|v| format!("{v:.4}")).unwrap_or_default();
-                let s = |v: &Option<String>| csv(v.as_deref().unwrap_or(""));
-                println!(
-                    "{},{},{},{},{},{},{},{},{},{},{},{:.0},{},{},{},{},{},{},{},{:.4},{},{},{}",
-                    r.started,
-                    csv(&r.host),
-                    csv(&r.pool),
-                    s(&r.repo),
-                    s(&r.workflow),
-                    s(&r.job),
-                    s(&r.actor),
-                    s(&r.triggering_actor),
-                    s(&r.event),
-                    s(&r.git_ref),
-                    csv(&r.result),
-                    r.duration_secs,
-                    f(r.queued_secs),
-                    f(r.cpu_seconds),
-                    f(r.cpu_utilization),
-                    r.github.as_ref().map(|c| c.sku.as_str()).unwrap_or(""),
-                    f(r.github.as_ref().map(|c| c.usd)),
-                    r.depot.as_ref().map(|c| c.sku.as_str()).unwrap_or(""),
-                    f(r.depot.as_ref().map(|c| c.usd)),
-                    r.electricity_usd,
-                    f(r.saved_vs_github_usd),
-                    f(r.saved_vs_depot_usd),
-                    s(&r.url),
-                );
-            }
-        }
+        Format::Csv => write_csv(&mut std::io::stdout().lock(), shown)?,
         Format::Table => {
             if shown.is_empty() {
                 println!("no jobs recorded yet");
@@ -226,6 +192,45 @@ pub fn print_jobs(records: &[JobRecord], limit: usize, format: Format) -> Result
                 );
             }
         }
+    }
+    Ok(())
+}
+
+pub fn write_csv(out: &mut impl Write, records: &[JobRecord]) -> Result<()> {
+    writeln!(
+        out,
+        "started,host,pool,repo,workflow,job,actor,triggering_actor,event,ref,result,duration_secs,queued_secs,cpu_seconds,cpu_utilization,github_sku,github_usd,depot_sku,depot_usd,electricity_usd,saved_vs_github_usd,saved_vs_depot_usd,url"
+    )?;
+    for r in records {
+        let f = |v: Option<f64>| v.map(|v| format!("{v:.4}")).unwrap_or_default();
+        let s = |v: &Option<String>| csv(v.as_deref().unwrap_or(""));
+        writeln!(
+            out,
+            "{},{},{},{},{},{},{},{},{},{},{},{:.0},{},{},{},{},{},{},{},{:.4},{},{},{}",
+            r.started,
+            csv(&r.host),
+            csv(&r.pool),
+            s(&r.repo),
+            s(&r.workflow),
+            s(&r.job),
+            s(&r.actor),
+            s(&r.triggering_actor),
+            s(&r.event),
+            s(&r.git_ref),
+            csv(&r.result),
+            r.duration_secs,
+            f(r.queued_secs),
+            f(r.cpu_seconds),
+            f(r.cpu_utilization),
+            r.github.as_ref().map(|c| c.sku.as_str()).unwrap_or(""),
+            f(r.github.as_ref().map(|c| c.usd)),
+            r.depot.as_ref().map(|c| c.sku.as_str()).unwrap_or(""),
+            f(r.depot.as_ref().map(|c| c.usd)),
+            r.electricity_usd,
+            f(r.saved_vs_github_usd),
+            f(r.saved_vs_depot_usd),
+            s(&r.url),
+        )?;
     }
     Ok(())
 }

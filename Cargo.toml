@@ -14,6 +14,7 @@ publish = false
 anyhow = "1"
 base64 = "0.22"
 clap = { version = "4", features = ["derive"] }
+eframe = { version = "0.37", optional = true }
 gethostname = "1"
 # native-tls keeps the build free of C toolchains: Security.framework on macOS, SChannel on Windows.
 reqwest = { version = "0.12", default-features = false, features = ["json", "native-tls"] }
@@ -24,9 +25,15 @@ sha2 = { version = "0.10", features = ["oid"] }
 tokio = { version = "1", features = ["full"] }
 tokio-util = "0.7"
 toml = "0.9"
+toml_edit = "0.25"
 tracing = "0.1"
 tracing-appender = "0.2"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[features]
+# `home-runner gui`. Build with --no-default-features for a headless supervisor.
+default = ["gui"]
+gui = ["dep:eframe"]
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
@@ -39,3 +46,4 @@ windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_
 lto = true
 codegen-units = 1
 strip = true
+

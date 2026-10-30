@@ -1,11 +1,11 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow};
-use tokio::sync::OnceCell;
+use tokio::sync::{Notify, OnceCell};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
@@ -14,8 +14,9 @@ use crate::accounting::{Accounting, PoolPricing};
 use crate::backend::Backend;
 use crate::config::{Config, PoolConfig};
 use crate::github::GitHub;
-use crate::power;
 use crate::runner_dist::RunnerDist;
+use crate::state::{self, Board, Phase, Slot};
+use crate::{fleet, hooks, power, timefmt};
 
 const MIN_BACKOFF: Duration = Duration::from_secs(5);
 const MAX_BACKOFF: Duration = Duration::from_secs(300);
@@ -49,6 +50,9 @@ struct Ctx {
     host_prefix: String,
     /// Names of runners a slot is currently responsible for. Reconcile never touches these.
     active: Mutex<HashSet<String>>,
+    board: Arc<Board>,
+    /// Signalled after each job is written to the ledger, so the fleet hears about it soon.
+    job_done: Arc<Notify>,
 }
 
 /// Marks a runner name as owned by a slot for as long as the claim lives.
@@ -157,11 +161,20 @@ pub async fn run(config: Config, shutdown: CancellationToken) -> Result<()> {
         accounting,
         pools,
     } = build(&config)?;
+    let mut board = Board::new(&config.data_dir(), base_state(&config, &gh, &pools));
+    for (p, pool) in pools.iter().enumerate() {
+        for slot in 0..pool.cfg.count {
+            board.slots.push(Slot::new(p, slot));
+        }
+    }
+    let board = Arc::new(board);
     let ctx = Arc::new(Ctx {
         gh,
         accounting,
         host_prefix: config.runner_prefix(),
         active: Mutex::default(),
+        board: board.clone(),
+        job_done: Arc::new(Notify::new()),
     });
     info!(
         host = %config.host_name(),
@@ -186,11 +199,27 @@ pub async fn run(config: Config, shutdown: CancellationToken) -> Result<()> {
     }
 
     let mut slots = JoinSet::new();
-    for pool in &pools {
-        for slot in 0..pool.cfg.count {
-            slots.spawn(slot_loop(ctx.clone(), pool.clone(), slot, shutdown.clone()));
-        }
+    for slot in &board.slots {
+        let pool = pools[slot.pool].clone();
+        slots.spawn(slot_loop(ctx.clone(), pool, slot.clone(), shutdown.clone()));
     }
+
+    let publisher = {
+        let (board, pools, stop) = (board.clone(), pools.clone(), CancellationToken::new());
+        let task = tokio::spawn(publish(board, pools, stop.clone()));
+        (task, stop)
+    };
+
+    let reporter = match fleet::Reporter::new(&config, board.clone()) {
+        Ok(Some(reporter)) => Some(tokio::spawn(
+            reporter.run(ctx.job_done.clone(), shutdown.clone()),
+        )),
+        Ok(None) => None,
+        Err(e) => {
+            warn!("fleet reporting is off: {e:#}");
+            None
+        }
+    };
 
     let reconciler = {
         let (ctx, pools, shutdown) = (ctx.clone(), pools.clone(), shutdown.clone());
@@ -218,18 +247,113 @@ pub async fn run(config: Config, shutdown: CancellationToken) -> Result<()> {
         warn!("some runners did not stop within 90s; the next start will clean them up");
     }
     reconciler.abort();
+    if let Some(reporter) = reporter {
+        let _ = tokio::time::timeout(Duration::from_secs(15), reporter).await;
+    }
+    publisher.1.cancel();
+    let _ = publisher.0.await;
     info!("stopped");
     Ok(())
 }
 
-async fn slot_loop(ctx: Arc<Ctx>, pool: Arc<Pool>, slot: usize, shutdown: CancellationToken) {
+/// The parts of the published state that don't change while running.
+fn base_state(config: &Config, gh: &GitHub, pools: &[Arc<Pool>]) -> state::State {
+    let rate = |id: &str, list: f64| config.pricing.rates.get(id).copied().unwrap_or(list);
+    state::State {
+        host: config.host_name(),
+        version: env!("CARGO_PKG_VERSION").into(),
+        pid: std::process::id(),
+        started_at: timefmt::now(),
+        updated_at: timefmt::now(),
+        running: true,
+        scope: gh.scope_label(),
+        electricity_usd_per_kwh: config.pricing.electricity_usd_per_kwh,
+        job_watts: config.pricing.job_watts,
+        pools: pools
+            .iter()
+            .map(|p| state::PoolState {
+                name: p.cfg.name.clone(),
+                backend: p.cfg.backend.kind().into(),
+                labels: p.labels.clone(),
+                os: p.pricing.os.clone(),
+                arch: p.pricing.arch.clone(),
+                cpus: p.pricing.cpus,
+                github_label: p.pricing.github.map(|s| s.label.to_string()),
+                github_usd_per_minute: p.pricing.github.map(|s| rate(s.id, s.usd_per_minute)),
+                slots: vec![],
+            })
+            .collect(),
+        reconcile: None,
+        fleet: None,
+    }
+}
+
+/// Rewrites `state.json` every couple of seconds and acts on the GUI's stop requests.
+async fn publish(board: Arc<Board>, pools: Vec<Arc<Pool>>, stop: CancellationToken) {
+    let mut last_ticks = hooks::cpu_ticks();
+    let mut warned = false;
+    loop {
+        board.take_stop_requests();
+        // Host-backend jobs keep their metadata on disk and share this machine's CPU.
+        let mut extra = HashMap::new();
+        for runner in board.busy_runners() {
+            if let Some(pool) = pools.iter().find(|p| runner.starts_with(&p.prefix))
+                && matches!(pool.backend, Backend::Host(_))
+            {
+                extra.insert(runner.clone(), pool.backend.collect(&runner).await);
+            }
+        }
+        let ticks = hooks::cpu_ticks();
+        let host_cpu = match (last_ticks, ticks) {
+            (Some((b0, t0)), Some((b1, t1))) if t1 > t0 => {
+                Some((b1.wrapping_sub(b0) as f32 / (t1 - t0) as f32).min(1.0))
+            }
+            _ => None,
+        };
+        last_ticks = ticks;
+
+        let mut current = board.collect(&extra, host_cpu);
+        let stopping = stop.is_cancelled();
+        if stopping {
+            current.running = false;
+            for slot in current.pools.iter_mut().flat_map(|p| p.slots.iter_mut()) {
+                slot.phase = Phase::Stopped;
+                slot.job = None;
+            }
+        }
+        match state::write(&board.path, &current) {
+            Ok(()) => warned = false,
+            Err(e) if !warned => {
+                warn!("writing {}: {e}", board.path.display());
+                warned = true;
+            }
+            Err(_) => {}
+        }
+        if stopping {
+            break;
+        }
+        tokio::select! {
+            _ = tokio::time::sleep(Duration::from_secs(state::PUBLISH_SECS)) => {}
+            _ = stop.cancelled() => {}
+        }
+    }
+}
+
+async fn slot_loop(ctx: Arc<Ctx>, pool: Arc<Pool>, status: Arc<Slot>, shutdown: CancellationToken) {
+    let slot = status.slot;
     let mut backoff = MIN_BACKOFF;
     while !shutdown.is_cancelled() {
-        match run_once(&ctx, &pool, slot, &shutdown).await {
-            Ok(Outcome::Completed) => backoff = MIN_BACKOFF,
+        let result = run_once(&ctx, &pool, &status, &shutdown).await;
+        status.end_runner();
+        match result {
+            Ok(Outcome::Completed) => {
+                backoff = MIN_BACKOFF;
+                status.ok();
+            }
             Ok(Outcome::Shutdown) => break,
             Err(e) => {
                 let delay = backoff + jitter();
+                status.backoff(format!("{e:#}"), timefmt::now() + delay.as_secs() as i64);
                 error!(pool = %pool.cfg.name, slot, "{e:#}; retrying in {}s", delay.as_secs());
                 backoff = (backoff * 2).min(MAX_BACKOFF);
                 tokio::select! {
@@ -239,21 +363,30 @@ async fn slot_loop(ctx: Arc<Ctx>, pool: Arc<Pool>, slot: usize, shutdown: Cancel
             }
         }
     }
+    status.set(Phase::Stopped);
 }
 
 /// One runner, one job: register → launch → wait → tear down → deregister.
 async fn run_once(
     ctx: &Ctx,
     pool: &Pool,
-    slot: usize,
+    status: &Slot,
     shutdown: &CancellationToken,
 ) -> Result<Outcome> {
+    let slot = status.slot;
+    if pool.ready.get().is_none() {
+        status.set(Phase::Preparing);
+    }
     tokio::select! {
         r = pool.ready() => r.with_context(|| format!("preparing the {} backend", pool.cfg.backend.kind()))?,
         _ = shutdown.cancelled() => return Ok(Outcome::Shutdown),
     }
     let name = format!("{}{slot}-{}", pool.prefix, short_id());
     let _claim = Claim::new(&ctx.active, &name);
+    // Cancelled when someone asks to stop this runner's job (see `state::request_stop`).
+    let stop = CancellationToken::new();
+    status.start_runner(&name, stop.clone());
+    status.set(Phase::Registering);
     let jit = ctx
         .gh
         .generate_jitconfig(&name, &pool.labels)
@@ -261,7 +394,8 @@ async fn run_once(
         .context("registering runner with GitHub")?;
     info!(runner = %name, "registered, waiting for a job");
 
-    let result = drive(ctx, pool, &name, &jit.encoded, shutdown).await;
+    let result = drive(ctx, pool, status, &name, &jit.encoded, shutdown, &stop).await;
+    status.set(Phase::Finishing);
 
     if let Err(e) = pool.backend.cleanup(&name).await {
         warn!(runner = %name, "cleanup failed, reconcile will retry: {e:#}");
@@ -275,15 +409,20 @@ async fn run_once(
 async fn drive(
     ctx: &Ctx,
     pool: &Pool,
+    status: &Slot,
     name: &str,
     jit_config: &str,
     shutdown: &CancellationToken,
+    stop: &CancellationToken,
 ) -> Result<Outcome> {
     let launched = Instant::now();
+    status.set(Phase::Launching);
     let mut running = tokio::select! {
         r = pool.backend.launch(name, jit_config, &pool.hook_env) => r.context("launching runner")?,
         _ = shutdown.cancelled() => return Ok(Outcome::Shutdown),
     };
+    status.watch(running.watch.clone());
+    status.set(Phase::Idle);
 
     // The timeout clock starts when a job starts, so idle runners can wait indefinitely.
     let timeout = Duration::from_secs(pool.cfg.job_timeout_minutes * 60);
@@ -299,11 +438,13 @@ async fn drive(
     enum Event {
         Exited(Result<std::process::ExitStatus>),
         TimedOut,
+        Stopped,
         Shutdown,
     }
     let event = tokio::select! {
         status = running.wait() => Event::Exited(status),
         _ = deadline => Event::TimedOut,
+        _ = stop.cancelled() => Event::Stopped,
         _ = shutdown.cancelled() => Event::Shutdown,
     };
 
@@ -332,6 +473,11 @@ async fn drive(
             running.kill().await;
             (Ok(Outcome::Completed), Some("TimedOut"))
         }
+        Event::Stopped => {
+            warn!(runner = %name, "stopping job on request");
+            running.kill().await;
+            (Ok(Outcome::Completed), Some("Canceled"))
+        }
         Event::Shutdown => {
             running.kill().await;
             (Ok(Outcome::Shutdown), Some("Interrupted"))
@@ -349,6 +495,7 @@ async fn drive(
         ctx.accounting
             .record(name, &pool.cfg, &pool.pricing, info)
             .await;
+        ctx.job_done.notify_one();
     }
     outcome
 }
@@ -356,6 +503,21 @@ async fn drive(
 /// Deletes GitHub registrations and backend resources that carry this machine's prefix but that
 /// no slot owns: leftovers from crashes, reboots and failed cleanups.
 async fn reconcile(ctx: &Ctx, pools: &[Arc<Pool>]) -> Result<()> {
+    let result = reconcile_inner(ctx, pools).await;
+    ctx.board.update(|s| {
+        let removed = result.as_ref().map_or(0, |n| *n);
+        s.reconcile = Some(state::ReconcileState {
+            at: timefmt::now(),
+            removed,
+            error: result.as_ref().err().map(|e| format!("{e:#}")),
+        });
+    });
+    result.map(|_| ())
+}
+
+/// Returns how many leftovers it removed.
+async fn reconcile_inner(ctx: &Ctx, pools: &[Arc<Pool>]) -> Result<usize> {
+    let mut removed = 0;
     let runners = ctx.gh.list_runners().await?;
     for runner in runners
         .iter()
@@ -369,8 +531,9 @@ async fn reconcile(ctx: &Ctx, pools: &[Arc<Pool>]) -> Result<()> {
             continue;
         }
         info!(runner = %runner.name, "removing stale runner registration");
-        if let Err(e) = ctx.gh.delete_runner(runner.id).await {
-            warn!(runner = %runner.name, "{e:#}");
+        match ctx.gh.delete_runner(runner.id).await {
+            Ok(()) => removed += 1,
+            Err(e) => warn!(runner = %runner.name, "{e:#}"),
         }
     }
     for pool in pools {
@@ -386,12 +549,13 @@ async fn reconcile(ctx: &Ctx, pools: &[Arc<Pool>]) -> Result<()> {
                 continue;
             }
             info!(pool = %pool.cfg.name, "removing orphaned {} {name}", pool.cfg.backend.kind());
-            if let Err(e) = pool.backend.cleanup(&name).await {
-                warn!("{e:#}");
+            match pool.backend.cleanup(&name).await {
+                Ok(()) => removed += 1,
+                Err(e) => warn!("{e:#}"),
             }
         }
     }
-    Ok(())
+    Ok(removed)
 }
 
 pub async fn status(path: &Path) -> Result<()> {
@@ -443,11 +607,17 @@ pub async fn cleanup(path: &Path) -> Result<()> {
         accounting,
         pools,
     } = build(&config)?;
+    let board = Arc::new(Board::new(
+        &config.data_dir(),
+        base_state(&config, &gh, &pools),
+    ));
     let ctx = Ctx {
         gh,
         accounting,
         host_prefix: config.runner_prefix(),
         active: Mutex::default(),
+        board,
+        job_done: Arc::new(Notify::new()),
     };
     reconcile(&ctx, &pools).await?;
     println!("cleanup complete");

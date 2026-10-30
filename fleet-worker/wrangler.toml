@@ -1,0 +1,12 @@
+name = "home-runner-fleet"
+main = "src/index.ts"
+compatibility_date = "2026-10-01"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "home-runner-fleet"
+# Replace with the id `wrangler d1 create home-runner-fleet` prints.
+database_id = "00000000-0000-0000-0000-000000000000"
+migrations_dir = "migrations"
+
+# Set with `wrangler secret put ADMIN_TOKEN`; it is only used to create fleets and invites.

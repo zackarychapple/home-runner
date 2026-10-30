@@ -17,7 +17,10 @@ const SH_COMMON: &str = r#"#!/bin/sh
 # Installed by home-runner. Records job metadata for its savings ledger; never fails the job.
 d="${HR_STATE_DIR:-/tmp/home-runner}"
 mkdir -p "$d" 2>/dev/null
-hr_cpu() {
+"#;
+
+/// Prints one CPU sample in the format `HR_CPU_MODE` calls for (see `cpu_usage`).
+const SH_CPU_FN: &str = r#"hr_cpu() {
   case "$HR_CPU_MODE" in
     usec) awk '/^usage_usec/ {printf "%.0f\n", $2}' /sys/fs/cgroup/cpu.stat 2>/dev/null ;;
     procstat) awk '/^cpu / {printf "%.0f %.0f\n", $2+$3+$4+$7+$8+$9, $2+$3+$4+$5+$6+$7+$8+$9}' /proc/stat 2>/dev/null ;;
@@ -43,7 +46,9 @@ const SH_STARTED: &str = r#"{
   echo "cpu_mode=${HR_CPU_MODE:-none}"
   echo "cpu_start=$(hr_cpu)"
   echo "hook_start=$(date +%s)"
-} 2>/dev/null > "$d/job.env"
+} 2>/dev/null > "$d/job.env.tmp"
+# Renamed into place so a reader never sees half a file.
+mv -f "$d/job.env.tmp" "$d/job.env" 2>/dev/null
 exit 0
 "#;
 
@@ -71,7 +76,7 @@ $now = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
 $cpu = if ($env:HR_EXE) { (& $env:HR_EXE cpu-sample) -join '' } else { '' }
 "#;
 
-const PS_STARTED: &str = r#"[IO.File]::WriteAllLines($f, [string[]]@(
+const PS_STARTED: &str = r#"[IO.File]::WriteAllLines("$f.tmp", [string[]]@(
   "repo=$env:GITHUB_REPOSITORY",
   "workflow=$env:GITHUB_WORKFLOW",
   "job_key=$env:GITHUB_JOB",
@@ -89,6 +94,7 @@ const PS_STARTED: &str = r#"[IO.File]::WriteAllLines($f, [string[]]@(
   "cpu_start=$cpu",
   "hook_start=$now"
 ))
+Move-Item -Force "$f.tmp" $f
 exit 0
 "#;
 
@@ -106,11 +112,11 @@ exit 0
 "#;
 
 pub fn sh_started() -> String {
-    format!("{SH_COMMON}{SH_STARTED}")
+    format!("{SH_COMMON}{SH_CPU_FN}{SH_STARTED}")
 }
 
 pub fn sh_completed() -> String {
-    format!("{SH_COMMON}{SH_COMPLETED}")
+    format!("{SH_COMMON}{SH_CPU_FN}{SH_COMPLETED}")
 }
 
 pub fn ps_started() -> String {
@@ -121,8 +127,19 @@ pub fn ps_completed() -> String {
     format!("{PS_COMMON}{PS_COMPLETED}")
 }
 
-/// A POSIX script fragment that installs both hooks under `$d` (which it expects to be set) and
-/// exports the runner's hook variables. Used inside containers and VMs.
+/// While the runner waits and works, a background loop prints what the started hook recorded as
+/// soon as it exists, then a CPU sample every few seconds, so the supervisor can show a VM's job
+/// live instead of only after the runner exits. [`SH_EMIT`] stops it.
+const SH_WATCH: &str = r#"(
+  while [ ! -s "$d/job.env" ]; do sleep 2; done
+  sed 's/^/::home-runner:: /' "$d/job.env"
+  while :; do echo "::home-runner:: cpu_live=$(hr_cpu) $(date +%s)"; sleep 5; done
+) &
+hr_watch=$!
+"#;
+
+/// A POSIX script fragment that installs both hooks under `$d` (which it expects to be set),
+/// exports the runner's hook variables and starts the live watcher. Used inside containers and VMs.
 pub fn sh_install_fragment() -> String {
     format!(
         r#"mkdir -p "$d/hooks"
@@ -134,14 +151,16 @@ chmod +x "$d/hooks/started.sh" "$d/hooks/completed.sh"
 export HR_STATE_DIR="$d"
 export ACTIONS_RUNNER_HOOK_JOB_STARTED="$d/hooks/started.sh"
 export ACTIONS_RUNNER_HOOK_JOB_COMPLETED="$d/hooks/completed.sh"
-"#,
+{SH_CPU_FN}{SH_WATCH}"#,
         sh_started(),
         sh_completed()
     )
 }
 
-/// Prints the hook output with [`MARKER`] so the supervisor can read it from the runner's stdout.
-pub const SH_EMIT: &str = r#"[ -f "$d/job.env" ] && sed 's/^/::home-runner:: /' "$d/job.env""#;
+/// Stops the watcher and prints the hook output with [`MARKER`] so the supervisor can read it
+/// from the runner's stdout.
+pub const SH_EMIT: &str = r#"{ kill "$hr_watch"; wait "$hr_watch"; } 2>/dev/null
+[ -f "$d/job.env" ] && sed 's/^/::home-runner:: /' "$d/job.env""#;
 
 /// Parses `key=value` lines (tolerating a UTF-8 BOM and CRLF from PowerShell).
 pub fn parse_env(text: &str) -> HashMap<String, String> {

@@ -47,6 +47,17 @@ pub fn uninstall() -> Result<()> {
     anyhow::bail!("no service to uninstall on this platform")
 }
 
+/// Restarts the installed service or agent.
+#[cfg_attr(not(feature = "gui"), allow(dead_code))]
+pub fn restart() -> Result<()> {
+    #[cfg(target_os = "macos")]
+    return launchd::restart();
+    #[cfg(windows)]
+    return windows::restart();
+    #[cfg(not(any(target_os = "macos", windows)))]
+    anyhow::bail!("no service to restart on this platform; restart `home-runner run` yourself")
+}
+
 pub fn run_service(config_path: PathBuf) -> Result<()> {
     #[cfg(windows)]
     return windows::run(config_path);

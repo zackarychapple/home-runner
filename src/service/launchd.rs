@@ -57,6 +57,21 @@ pub fn uninstall() -> Result<()> {
     Ok(())
 }
 
+/// Restarts the running agent so it picks up config changes.
+pub fn restart() -> Result<()> {
+    let target = format!("{}/{LABEL}", gui_domain()?);
+    let out = Command::new("launchctl")
+        .args(["kickstart", "-k", &target])
+        .output()?;
+    if !out.status.success() {
+        bail!(
+            "launchctl kickstart failed (is the agent installed? run `home-runner install`): {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(())
+}
+
 fn plist_path() -> PathBuf {
     home_dir()
         .join("Library/LaunchAgents")

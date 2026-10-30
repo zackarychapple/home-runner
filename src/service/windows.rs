@@ -190,6 +190,21 @@ pub fn uninstall() -> Result<()> {
     Ok(())
 }
 
+/// Restarts the service so it picks up config changes. Needs an Administrator.
+pub fn restart() -> Result<()> {
+    let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
+        .context("connecting to the service manager")?;
+    let service = manager
+        .open_service(
+            SERVICE_NAME,
+            ServiceAccess::QUERY_STATUS | ServiceAccess::STOP | ServiceAccess::START,
+        )
+        .context("opening the home-runner service (restarting it needs an Administrator)")?;
+    stop_and_wait(&service)?;
+    service.start(&[] as &[&OsStr])?;
+    Ok(())
+}
+
 fn stop_and_wait(service: &windows_service::service::Service) -> Result<()> {
     if service.query_status()?.current_state == ServiceState::Stopped {
         return Ok(());
