@@ -19,6 +19,8 @@ mod proc;
 mod runner_dist;
 mod selftest;
 mod service;
+#[cfg(unix)]
+mod setup;
 #[cfg(test)]
 mod testutil;
 mod timefmt;
@@ -143,6 +145,10 @@ enum Command {
     },
     /// Remove the background service.
     Uninstall,
+    /// Put `home-runner` on your shell's PATH and, on a Mac, the desktop app in /Applications.
+    /// `install` does this too; run it on its own after replacing the binary somewhere else.
+    #[cfg(unix)]
+    Setup,
     /// List jobs this machine has run: repo, workflow, who triggered it, time, CPU and savings.
     Jobs {
         #[command(flatten)]
@@ -252,6 +258,8 @@ fn main() -> Result<()> {
             password,
         } => service::install(&config.path(), account, password),
         Command::Uninstall => service::uninstall(),
+        #[cfg(unix)]
+        Command::Setup => setup::run(&std::env::current_exe()?),
         Command::Jobs {
             config,
             query,
