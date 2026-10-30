@@ -173,6 +173,12 @@ Anything a job leaves in `/cache` is visible to the next job on that slot, so gi
 ./images/macos-latest/build.sh RUST_TOOLCHAIN=1.99.0 NODE_VERSION=26 PNPM_VERSION=10.33.1
 ```
 
+To keep Cirrus Labs' image as it is but stop using its public `admin`/`admin` password, build a key-only image (the same VM with just your SSH key authorized) and point the pool at it with `ssh_key` and no `ssh_password`:
+
+```sh
+./images/macos-latest/build.sh IMAGE=home-runner-macos-keyed PROVISION=false
+```
+
 ```toml
 [[pool]]
 name = "macos"

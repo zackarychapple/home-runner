@@ -4,12 +4,15 @@
 #   build.sh [NAME=VALUE ...]
 # e.g. build.sh RUST_TOOLCHAIN=1.99.0 NODE_VERSION=26 BREW_PACKAGES="jq"
 # Settings: BASE (source image), IMAGE (local VM name), SSH_KEY (public key to authorize), plus the
-# versions in provision.sh. Building needs one free macOS VM slot (macOS allows two at a time).
+# versions in provision.sh. PROVISION=false skips the toolchains and only authorizes the key, for a
+# pool that wants Cirrus Labs' image as it is but without the default admin/admin password login:
+#   build.sh IMAGE=home-runner-macos-keyed PROVISION=false Building needs one free macOS VM slot (macOS allows two at a time).
 set -eu
 cd "$(dirname "$0")"
 BASE=ghcr.io/cirruslabs/macos-tahoe-xcode:latest
 IMAGE=home-runner-macos-latest
 SSH_KEY="$HOME/.home-runner/tart_ed25519.pub"
+PROVISION=true
 NODE_VERSION=26
 PNPM_VERSION=10.33.1
 RUST_TOOLCHAIN=1.99.0
@@ -48,10 +51,12 @@ until ssh_vm true 2>/dev/null; do
 done
 
 ssh_vm 'mkdir -p ~/.ssh && chmod 700 ~/.ssh && cat >> ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys' < "$SSH_KEY"
-ssh_vm "cat > /tmp/provision.sh" < provision.sh
-ssh_vm "NODE_VERSION='$NODE_VERSION' PNPM_VERSION='$PNPM_VERSION' RUST_TOOLCHAIN='$RUST_TOOLCHAIN' \
-  RUST_COMPONENTS='$RUST_COMPONENTS' RUST_TARGETS='$RUST_TARGETS' SCCACHE_VERSION='$SCCACHE_VERSION' \
-  BREW_PACKAGES='$BREW_PACKAGES' bash /tmp/provision.sh && rm /tmp/provision.sh"
+if [ "$PROVISION" = true ]; then
+  ssh_vm "cat > /tmp/provision.sh" < provision.sh
+  ssh_vm "NODE_VERSION='$NODE_VERSION' PNPM_VERSION='$PNPM_VERSION' RUST_TOOLCHAIN='$RUST_TOOLCHAIN' \
+    RUST_COMPONENTS='$RUST_COMPONENTS' RUST_TARGETS='$RUST_TARGETS' SCCACHE_VERSION='$SCCACHE_VERSION' \
+    BREW_PACKAGES='$BREW_PACKAGES' bash /tmp/provision.sh && rm /tmp/provision.sh"
+fi
 ssh_vm 'sudo shutdown -h now' >/dev/null 2>&1 || true
 i=0
 while tart list --format json | python3 -c 'import json,sys; sys.exit(0 if any(v["Name"]==sys.argv[1] and v["Running"] for v in json.load(sys.stdin)) else 1)' "$vm"; do
