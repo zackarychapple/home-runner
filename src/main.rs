@@ -53,6 +53,49 @@ struct ConfigArg {
     config: Option<PathBuf>,
 }
 
+/// Which pools `drain` and `resume` act on; none means the whole machine.
+#[derive(Args)]
+struct PoolArgs {
+    /// A pool to act on (repeatable).
+    #[arg(long = "pool", value_name = "NAME")]
+    pool: Vec<String>,
+    /// Act on every pool with this backend (host, docker, apple-container, tart); repeatable.
+    #[arg(long = "backend", value_name = "KIND")]
+    backend: Vec<String>,
+}
+
+impl PoolArgs {
+    fn resolve(&self, config: &config::Config) -> anyhow::Result<Vec<String>> {
+        let mut names = Vec::new();
+        for name in &self.pool {
+            anyhow::ensure!(
+                config.pools.iter().any(|p| &p.name == name),
+                "no pool named {name:?}; configured: {}",
+                config
+                    .pools
+                    .iter()
+                    .map(|p| p.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+            names.push(name.clone());
+        }
+        for kind in &self.backend {
+            let matching: Vec<_> = config
+                .pools
+                .iter()
+                .filter(|p| p.backend.kind() == kind)
+                .map(|p| p.name.clone())
+                .collect();
+            anyhow::ensure!(!matching.is_empty(), "no pool uses the {kind:?} backend");
+            names.extend(matching);
+        }
+        names.sort();
+        names.dedup();
+        Ok(names)
+    }
+}
+
 impl ConfigArg {
     fn path(&self) -> PathBuf {
         self.config
@@ -111,10 +154,19 @@ enum Command {
         json: bool,
     },
     /// Stop taking jobs: idle runners are removed, running jobs finish. For upgrades and
-    /// maintenance; `resume` undoes it.
+    /// maintenance; `resume` undoes it. With --pool or --backend only those pools stop, which
+    /// frees their VMs and containers while the others keep taking jobs.
     Drain {
         #[command(flatten)]
         config: ConfigArg,
+        #[command(flatten)]
+        pools: PoolArgs,
+        /// Resume by itself after this long, e.g. 2h.
+        #[arg(long = "for", value_name = "DURATION")]
+        duration: Option<String>,
+        /// Why, shown in `status`, the UI and the fleet view.
+        #[arg(long)]
+        reason: Option<String>,
         /// Wait until no job is running.
         #[arg(long)]
         wait: bool,
@@ -126,6 +178,8 @@ enum Command {
     Resume {
         #[command(flatten)]
         config: ConfigArg,
+        #[command(flatten)]
+        pools: PoolArgs,
     },
     /// Remove idle runner registrations, VMs and containers this machine left behind.
     /// Stop the service first.
@@ -256,15 +310,33 @@ fn main() -> Result<()> {
         }
         Command::Drain {
             config,
+            pools,
+            duration,
+            reason,
             wait,
             timeout,
         } => {
             let config = config::Config::load(&config.path())?;
             let timeout = timefmt::parse_since(&timeout)?
                 .ok_or_else(|| anyhow::anyhow!("--timeout must be a duration like 6h"))?;
-            runtime()?.block_on(health::drain(&config, wait.then_some(timeout)))
+            let duration = duration
+                .map(|d| {
+                    timefmt::parse_since(&d)?
+                        .ok_or_else(|| anyhow::anyhow!("--for must be a duration like 2h"))
+                })
+                .transpose()?;
+            let request = health::DrainRequest {
+                pools: pools.resolve(&config)?,
+                duration,
+                reason,
+                wait: wait.then_some(timeout),
+            };
+            runtime()?.block_on(health::drain(&config, request))
         }
-        Command::Resume { config } => health::resume(&config::Config::load(&config.path())?),
+        Command::Resume { config, pools } => {
+            let config = config::Config::load(&config.path())?;
+            health::resume(&config, &pools.resolve(&config)?)
+        }
         Command::Cleanup { config } => {
             let _log = logging::init(None);
             runtime()?.block_on(daemon::cleanup(&config.path()))

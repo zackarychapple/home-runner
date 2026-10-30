@@ -372,6 +372,10 @@ fn pools(ui: &mut Ui, pools: &[PoolState]) {
                     ui.set_width(150.0);
                     ui.label(RichText::new(&pool.name).strong());
                     ui.label(RichText::new(&pool.backend).size(11.5).color(MUTED));
+                    if let Some(hold) = &pool.paused {
+                        ui.label(RichText::new("paused").size(11.5).color(WARN))
+                            .on_hover_text(hold.describe());
+                    }
                 });
                 ui.horizontal_wrapped(|ui| {
                     ui.set_max_width(ui.available_width() - 260.0);
@@ -426,12 +430,36 @@ fn supervisor_notices(ui: &mut Ui, app: &mut App, snap: &Snapshot, state: &crate
             ui.label(RichText::new(alert).strong());
         });
     }
-    if state.draining {
+    if !state.drain.is_empty() {
         callout(ui, WARN, |ui| {
-            ui.label(RichText::new("Draining.").strong());
-            ui.label("No new jobs start here; running jobs finish.");
+            let whole = state.drain.all.as_ref();
+            ui.label(
+                RichText::new(if whole.is_some() {
+                    "Draining.".to_string()
+                } else {
+                    format!(
+                        "Draining {}.",
+                        state
+                            .drain
+                            .pools
+                            .keys()
+                            .cloned()
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )
+                })
+                .strong(),
+            );
+            ui.label("No new jobs start there; running jobs finish.");
+            for (scope, hold) in whole
+                .map(|h| ("all pools", h))
+                .into_iter()
+                .chain(state.drain.pools.iter().map(|(p, h)| (p.as_str(), h)))
+            {
+                ui.label(RichText::new(format!("{scope}: {}", hold.describe())).color(MUTED));
+            }
             if ui.button("Resume").clicked() {
-                match std::fs::remove_file(crate::health::drain_path(&snap.data_dir)) {
+                match crate::health::write_drain(&snap.data_dir, &crate::health::Drain::default()) {
                     Ok(()) => app.notify("Resumed: runners will register again", true),
                     Err(e) => app.notify(format!("Couldn't resume: {e}"), false),
                 }

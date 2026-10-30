@@ -1,9 +1,10 @@
 //! What the supervisor tells the outside world about itself: a state file other commands read,
 //! drain requests, and alerts when a pool can't keep a runner online.
 //!
-//! The supervisor and the CLI never talk over a socket. `home-runner drain` creates a flag file in
-//! the data directory and the supervisor notices it within a couple of seconds; the supervisor
-//! rewrites `state.json` every few seconds so `status` and `drain --wait` can see what it is doing.
+//! The supervisor and the CLI never talk over a socket. `home-runner drain` writes a flag file in
+//! the data directory (which pools, since when, why, until when) and the supervisor notices it
+//! within a couple of seconds; the supervisor rewrites `state.json` every few seconds so `status`
+//! and `drain --wait` can see what it is doing.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -34,7 +35,7 @@ pub enum Phase {
     Busy,
     /// The last attempt failed; waiting before the next one.
     Backoff,
-    /// Draining: not running anything.
+    /// Drained: not running anything.
     Paused,
     /// The machine's supervisor has stopped. Only seen in fleet reports.
     Offline,
@@ -188,7 +189,10 @@ pub struct State {
     pub pid: u32,
     pub started_at: i64,
     pub updated_at: i64,
+    /// Every pool is drained (the plain `drain`).
     pub draining: bool,
+    /// What is drained, since when, why and until when.
+    pub drain: Drain,
     /// Last time GitHub answered an API call.
     pub github_ok_at: i64,
     pub slots: Vec<SlotState>,
@@ -216,6 +220,9 @@ pub struct PoolState {
     /// The GitHub-hosted runner jobs are priced against, and its per-minute rate.
     pub github_label: Option<String>,
     pub github_usd_per_minute: Option<f64>,
+    /// Set while the pool is drained, by its own request or the whole machine's.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub paused: Option<Hold>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub slots: Vec<SlotState>,
 }
@@ -238,10 +245,6 @@ impl State {
         now - self.updated_at <= STATE_STALE_SECS
     }
 
-    pub fn busy(&self) -> usize {
-        self.slots.iter().filter(|s| s.phase == Phase::Busy).count()
-    }
-
     /// Pools with their slots.
     pub fn pools(&self) -> Vec<PoolState> {
         self.pools
@@ -253,14 +256,28 @@ impl State {
                     .filter(|s| s.pool == p.name)
                     .cloned()
                     .collect(),
+                paused: self.drain.hold_for(&p.name).cloned(),
                 ..p.clone()
             })
             .collect()
     }
 
-    /// Every slot has stopped taking work.
-    pub fn drained(&self) -> bool {
-        self.slots.iter().all(|s| s.phase == Phase::Paused)
+    /// Every slot of these pools (every pool, when `pools` is empty) has stopped taking work.
+    pub fn drained(&self, pools: &[String]) -> bool {
+        self.in_pools(pools).all(|s| s.phase == Phase::Paused)
+    }
+
+    /// Jobs running in these pools (every pool, when `pools` is empty).
+    pub fn busy_in(&self, pools: &[String]) -> usize {
+        self.in_pools(pools)
+            .filter(|s| s.phase == Phase::Busy)
+            .count()
+    }
+
+    fn in_pools<'a>(&'a self, pools: &'a [String]) -> impl Iterator<Item = &'a SlotState> {
+        self.slots
+            .iter()
+            .filter(move |s| pools.is_empty() || pools.contains(&s.pool))
     }
 }
 
@@ -268,12 +285,120 @@ pub fn state_path(data_dir: &Path) -> PathBuf {
     data_dir.join(STATE_FILE)
 }
 
+/// Why, since when and until when something has stopped taking jobs.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Hold {
+    /// Unix time the drain was requested.
+    pub since: i64,
+    /// Unix time it ends by itself; `None` lasts until `resume`.
+    pub until: Option<i64>,
+    pub reason: Option<String>,
+}
+
+impl Hold {
+    fn expired(&self, now: i64) -> bool {
+        self.until.is_some_and(|until| until <= now)
+    }
+
+    /// `since 2026-10-29 10:05 (until 2026-10-29 12:05): rebuilding the image`
+    pub fn describe(&self) -> String {
+        let mut text = format!("since {}", timefmt::short(self.since));
+        if let Some(until) = self.until {
+            text.push_str(&format!(", until {}", timefmt::short(until)));
+        }
+        if let Some(reason) = &self.reason {
+            text.push_str(&format!(": {reason}"));
+        }
+        text
+    }
+}
+
+/// The drain flag file: the whole machine, and/or named pools.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Drain {
+    /// Every pool.
+    pub all: Option<Hold>,
+    pub pools: BTreeMap<String, Hold>,
+}
+
+impl Drain {
+    pub fn is_empty(&self) -> bool {
+        self.all.is_none() && self.pools.is_empty()
+    }
+
+    /// The hold that keeps this pool from taking jobs, if any. The pool's own comes first.
+    pub fn hold_for(&self, pool: &str) -> Option<&Hold> {
+        self.pools.get(pool).or(self.all.as_ref())
+    }
+
+    /// Without the holds that have run out by `now`.
+    pub fn live(&self, now: i64) -> Drain {
+        Drain {
+            all: self.all.clone().filter(|h| !h.expired(now)),
+            pools: self
+                .pools
+                .iter()
+                .filter(|(_, h)| !h.expired(now))
+                .map(|(p, h)| (p.clone(), h.clone()))
+                .collect(),
+        }
+    }
+}
+
 pub fn drain_path(data_dir: &Path) -> PathBuf {
     data_dir.join(DRAIN_FILE)
 }
 
-pub fn drain_requested(data_dir: &Path) -> bool {
-    drain_path(data_dir).exists()
+/// The flag file as written, expired holds included. A file from before pools could be drained
+/// separately holds a timestamp, or nothing, and drains the whole machine.
+pub fn load_drain(data_dir: &Path) -> Drain {
+    let path = drain_path(data_dir);
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return Drain::default();
+    };
+    serde_json::from_str(&text).unwrap_or_else(|_| Drain {
+        all: Some(Hold {
+            since: timefmt::parse_rfc3339(text.trim()).unwrap_or_default(),
+            ..Default::default()
+        }),
+        ..Default::default()
+    })
+}
+
+/// What is drained right now.
+pub fn read_drain(data_dir: &Path, now: i64) -> Drain {
+    load_drain(data_dir).live(now)
+}
+
+/// Writes the flag file, or removes it when nothing is drained.
+pub fn write_drain(data_dir: &Path, drain: &Drain) -> Result<()> {
+    let path = drain_path(data_dir);
+    if drain.is_empty() {
+        return match std::fs::remove_file(&path) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                Err(e).with_context(|| format!("removing {}", path.display()))
+            }
+            _ => Ok(()),
+        };
+    }
+    std::fs::create_dir_all(data_dir)?;
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, serde_json::to_vec_pretty(drain)?)
+        .with_context(|| format!("writing {}", tmp.display()))?;
+    std::fs::rename(&tmp, &path).with_context(|| format!("replacing {}", path.display()))?;
+    Ok(())
+}
+
+/// Drops holds that have run out from the flag file, so a later reader doesn't revive them.
+pub fn expire_drain(data_dir: &Path, now: i64) -> Result<()> {
+    let stored = load_drain(data_dir);
+    let live = stored.live(now);
+    if live != stored {
+        write_drain(data_dir, &live)?;
+    }
+    Ok(())
 }
 
 /// Atomic, so a reader never sees half a file.
@@ -484,35 +609,82 @@ impl Notifier {
 // ---------------------------------------------------------------------------------------------
 // `drain` and `resume`
 
-/// Asks the running supervisor to stop taking jobs: idle runners are deregistered, running jobs
-/// finish. With `wait`, returns once nothing is running.
-pub async fn drain(config: &Config, wait: Option<Duration>) -> Result<()> {
+/// What `home-runner drain` was asked to do.
+#[derive(Debug, Default)]
+pub struct DrainRequest {
+    /// Pools to drain; empty means the whole machine.
+    pub pools: Vec<String>,
+    /// Resume by itself after this long.
+    pub duration: Option<Duration>,
+    pub reason: Option<String>,
+    /// Wait until no job is running, for at most this long.
+    pub wait: Option<Duration>,
+}
+
+/// Asks the running supervisor to stop taking jobs: idle runners are deregistered (and their VMs
+/// or containers removed), running jobs finish. With `wait`, returns once nothing is running.
+pub async fn drain(config: &Config, request: DrainRequest) -> Result<()> {
     let dir = config.data_dir();
-    std::fs::create_dir_all(&dir)?;
-    std::fs::write(
-        drain_path(&dir),
-        format!("{}\n", timefmt::rfc3339(timefmt::now())),
-    )
-    .with_context(|| format!("writing {}", drain_path(&dir).display()))?;
-    println!("drain requested: idle runners are being removed and running jobs will finish");
-    let Some(timeout) = wait else {
+    let now = timefmt::now();
+    let hold = Hold {
+        since: now,
+        until: request.duration.map(|d| now + d.as_secs() as i64),
+        reason: request.reason.filter(|r| !r.trim().is_empty()),
+    };
+    let mut drain = load_drain(&dir).live(now);
+    if request.pools.is_empty() {
+        drain.all = Some(hold);
+    } else {
+        for pool in &request.pools {
+            drain.pools.insert(pool.clone(), hold.clone());
+        }
+    }
+    write_drain(&dir, &drain)?;
+    let scope = if request.pools.is_empty() {
+        "all pools".to_string()
+    } else {
+        format!("pool(s) {}", request.pools.join(", "))
+    };
+    println!(
+        "drain requested for {scope}: idle runners are being removed and running jobs will finish"
+    );
+    if let Some(until) = drain_until(&request.pools, &drain) {
+        println!("resumes by itself at {}", timefmt::short(until));
+    }
+    let Some(timeout) = request.wait else {
         println!("`home-runner resume` puts this machine back in service");
         return Ok(());
     };
     let deadline = tokio::time::Instant::now() + timeout;
     let mut last_report = None;
     loop {
+        let on_file = read_drain(&dir, timefmt::now());
+        let still_drained = if request.pools.is_empty() {
+            on_file.all.is_some()
+        } else {
+            request.pools.iter().all(|p| on_file.hold_for(p).is_some())
+        };
+        if !still_drained {
+            bail!("the drain ended before the jobs finished (resumed, or its --for ran out)");
+        }
         match read_state(&dir).filter(|s| s.is_fresh(timefmt::now())) {
             None => {
                 println!("no supervisor is running here; nothing to wait for");
                 return Ok(());
             }
-            Some(state) if state.draining && state.drained() => {
+            Some(state)
+                if request
+                    .pools
+                    .iter()
+                    .all(|p| state.drain.hold_for(p).is_some())
+                    && (!request.pools.is_empty() || state.draining)
+                    && state.drained(&request.pools) =>
+            {
                 println!("drained: no runners are registered and no jobs are running");
                 return Ok(());
             }
             Some(state) => {
-                let busy = state.busy();
+                let busy = state.busy_in(&request.pools);
                 if last_report != Some(busy) {
                     println!("waiting for {busy} running job(s) to finish…");
                     last_report = Some(busy);
@@ -526,12 +698,41 @@ pub async fn drain(config: &Config, wait: Option<Duration>) -> Result<()> {
     }
 }
 
-pub fn resume(config: &Config) -> Result<()> {
-    let path = drain_path(&config.data_dir());
-    match std::fs::remove_file(&path) {
-        Ok(()) => println!("resumed: runners will register again"),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => println!("not draining"),
-        Err(e) => return Err(e).with_context(|| format!("removing {}", path.display())),
+/// When the drain of these pools (the whole machine when empty) ends by itself, if it does.
+fn drain_until(pools: &[String], drain: &Drain) -> Option<i64> {
+    if pools.is_empty() {
+        drain.all.as_ref()?.until
+    } else {
+        pools
+            .iter()
+            .map(|p| drain.hold_for(p).and_then(|h| h.until))
+            .collect::<Option<Vec<_>>>()?
+            .into_iter()
+            .max()
+    }
+}
+
+/// Undoes `drain`: the named pools, or everything when `pools` is empty.
+pub fn resume(config: &Config, pools: &[String]) -> Result<()> {
+    let dir = config.data_dir();
+    let mut drain = load_drain(&dir).live(timefmt::now());
+    if drain.is_empty() {
+        println!("not draining");
+        return Ok(());
+    }
+    if pools.is_empty() {
+        drain = Drain::default();
+    } else {
+        for pool in pools {
+            drain.pools.remove(pool);
+        }
+    }
+    write_drain(&dir, &drain)?;
+    println!("resumed: runners will register again");
+    if !pools.is_empty() && drain.all.is_some() {
+        println!(
+            "the whole machine is still drained; `home-runner resume` without --pool ends that"
+        );
     }
     Ok(())
 }
@@ -737,18 +938,95 @@ mod tests {
         write_state(&dir, &state).unwrap();
         let read = read_state(&dir).unwrap();
         assert_eq!(read.pid, 7);
-        assert_eq!(read.busy(), 1);
-        assert!(!read.drained());
+        assert!(!read.drained(&[]));
+        assert!(
+            read.drained(&["x".to_string()]),
+            "no slots of a pool that has none"
+        );
+        assert_eq!(read.busy_in(&["p".to_string()]), 1);
         let pools = read.pools();
         assert_eq!(pools[0].slots.len(), 2);
         assert!(read.is_fresh(200 + STATE_STALE_SECS));
         assert!(!read.is_fresh(200 + STATE_STALE_SECS + 1));
 
-        assert!(!drain_requested(&dir));
-        std::fs::write(drain_path(&dir), "").unwrap();
-        assert!(drain_requested(&dir));
         remove_state(&dir);
         assert!(read_state(&dir).is_none());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    fn hold(since: i64, until: Option<i64>, reason: &str) -> Hold {
+        Hold {
+            since,
+            until,
+            reason: Some(reason.into()),
+        }
+    }
+
+    #[test]
+    fn a_pool_hold_applies_to_that_pool_only() {
+        let drain = Drain {
+            pools: BTreeMap::from([("macos".into(), hold(1, None, "image"))]),
+            ..Default::default()
+        };
+        assert!(drain.hold_for("macos").is_some());
+        assert!(drain.hold_for("linux").is_none());
+        let all = Drain {
+            all: Some(hold(1, None, "upgrade")),
+            ..drain
+        };
+        assert_eq!(
+            all.hold_for("macos").unwrap().reason.as_deref(),
+            Some("image"),
+            "a pool's own hold wins"
+        );
+        assert_eq!(
+            all.hold_for("linux").unwrap().reason.as_deref(),
+            Some("upgrade")
+        );
+    }
+
+    #[test]
+    fn holds_expire_by_themselves() {
+        let drain = Drain {
+            all: Some(hold(0, Some(100), "a")),
+            pools: BTreeMap::from([
+                ("macos".into(), hold(0, Some(50), "b")),
+                ("linux".into(), hold(0, None, "c")),
+            ]),
+        };
+        assert_eq!(drain.live(49), drain);
+        let live = drain.live(50);
+        assert!(live.pools.contains_key("linux") && !live.pools.contains_key("macos"));
+        assert!(live.all.is_some());
+        let live = drain.live(100);
+        assert!(live.all.is_none());
+        assert_eq!(live.pools.len(), 1, "a hold with no end never expires");
+    }
+
+    #[test]
+    fn the_flag_file_round_trips_expires_and_reads_the_old_format() {
+        let dir = std::env::temp_dir().join(format!("hr-drain-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(read_drain(&dir, 0).is_empty());
+
+        // The file before pools could be drained separately: a timestamp, or nothing.
+        std::fs::write(drain_path(&dir), "2026-10-29T10:05:00Z\n").unwrap();
+        let old = read_drain(&dir, 0);
+        assert_eq!(old.all.as_ref().unwrap().since, 1_793_268_300);
+        assert!(old.pools.is_empty());
+        std::fs::write(drain_path(&dir), "").unwrap();
+        assert!(read_drain(&dir, 0).all.is_some());
+
+        let drain = Drain {
+            pools: BTreeMap::from([("macos".into(), hold(10, Some(20), "image"))]),
+            ..Default::default()
+        };
+        write_drain(&dir, &drain).unwrap();
+        assert_eq!(read_drain(&dir, 19), drain);
+        assert!(read_drain(&dir, 20).is_empty());
+        assert!(drain_path(&dir).exists(), "still on disk until pruned");
+        expire_drain(&dir, 20).unwrap();
+        assert!(!drain_path(&dir).exists());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

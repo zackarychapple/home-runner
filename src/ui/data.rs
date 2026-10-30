@@ -200,6 +200,9 @@ mod tests {
         assert_eq!(visible_state(Some(&state)), before);
         state.draining = true;
         assert_ne!(visible_state(Some(&state)), before);
+        state.draining = false;
+        state.drain.pools.insert("macos".into(), Default::default());
+        assert_ne!(visible_state(Some(&state)), before);
         assert_ne!(visible_state(None), before);
     }
 }
