@@ -68,6 +68,7 @@ sudo xcodebuild -runFirstLaunch >/dev/null 2>&1 || true
 # Spotlight indexing a build tree costs CPU for nothing.
 sudo mdutil -a -i off >/dev/null 2>&1 || true
 
-. "$HOME/.home-runner/env"
+# /cache only exists once the VM has rebooted with synthetic.conf, so its mkdir may fail here.
+set +e; . "$HOME/.home-runner/env" 2>/dev/null; set -e
 echo "node $(node --version), pnpm $(pnpm --version), $(rustc --version), $(sccache --version)"
 rustup target list --installed

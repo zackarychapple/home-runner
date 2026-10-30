@@ -76,7 +76,11 @@ PY
     || { echo "downloaded $CEF_ARCHIVE does not match the pinned sha1 $CEF_SHA1" >&2; exit 1; }
   mkdir "$work/dist"
   tar -xjf "$work/$CEF_ARCHIVE" -C "$work/dist" --strip-components=1
-  # The layout cef-dll-sys expects of an extracted distribution.
+  # The layout cef-dll-sys expects of an extracted distribution: the framework beside include/, not
+  # under the Release/ folder CEF's archive puts it in.
+  if [ -d "$work/dist/Release" ]; then
+    mv "$work/dist/Release"/* "$work/dist/" && rmdir "$work/dist/Release"
+  fi
   printf '{\n  "type": "minimal",\n  "name": "%s",\n  "sha1": "%s"\n}\n' "$CEF_ARCHIVE" "$CEF_SHA1" > "$work/dist/archive.json"
   (cd "$work/dist" && find . -type f -print0 | LC_ALL=C sort -z | xargs -0 shasum -a 256) > "$work/manifest"
   sudo rm -rf "$cef"
