@@ -574,7 +574,8 @@ mod tests {
 
     #[test]
     fn the_readme_profile_example_is_valid() {
-        let readme = include_str!("../README.md");
+        // Windows checks the README out with CRLF line endings.
+        let readme = include_str!("../README.md").replace("\r\n", "\n");
         let block = readme
             .split("```toml\n")
             .skip(1)
