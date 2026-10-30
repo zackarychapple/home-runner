@@ -574,7 +574,8 @@ mod tests {
 
     #[test]
     fn the_readme_profile_example_is_valid() {
-        let readme = include_str!("../README.md");
+        // Windows checks the README out with CRLF line endings.
+        let readme = include_str!("../README.md").replace("\r\n", "\n");
         let block = readme
             .split("```toml\n")
             .skip(1)
@@ -584,7 +585,14 @@ mod tests {
         let text =
             format!("[github]\norg = \"o\"\n[github.auth]\ntype = \"token\"\nenv = \"X\"\n{block}");
         let config: Config = toml::from_str(&text).unwrap();
-        config.validate().unwrap();
+        // The example's pool is an apple-container one, which only validates on Apple Silicon.
+        if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+            config.validate().unwrap();
+        } else {
+            for profile in &config.profiles {
+                profile.validate().unwrap();
+            }
+        }
         assert_eq!(config.profiles[0].requirements.len(), 5);
         assert_eq!(config.pools[0].profile.as_deref(), Some("with-tap"));
     }
