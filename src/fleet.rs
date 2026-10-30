@@ -302,12 +302,15 @@ pub fn redact(mut r: JobRecord, share: Share, hash_private: bool) -> JobRecord {
             r.repo = None;
             r.workflow = None;
             r.job = None;
+            r.steps.clear();
         }
         // Unknown visibility counts as private.
         Share::Repos if hash_private && r.repo_private != Some(false) => {
             r.repo = r.repo.as_deref().map(hash_repo);
             r.workflow = None;
             r.job = None;
+            // Step names (`Deploy to prod`) say as much about a private repo as its workflow does.
+            r.steps.clear();
         }
         _ => {}
     }
@@ -549,6 +552,40 @@ mod tests {
         assert!(totals.repo.is_none() && totals.job.is_none());
         assert_eq!(totals.saved_vs_github_usd, Some(0.5));
         assert_eq!(hash_repo("Acme/App"), hash_repo("acme/app"));
+    }
+
+    #[test]
+    fn step_names_leave_only_for_public_or_named_repos() {
+        let with_steps = |private| {
+            let mut r = record("a", private);
+            r.steps = vec![crate::ledger::StepRecord {
+                name: "Deploy".into(),
+                ..Default::default()
+            }];
+            r
+        };
+        assert_eq!(
+            redact(with_steps(Some(false)), Share::Repos, true)
+                .steps
+                .len(),
+            1
+        );
+        assert_eq!(
+            redact(with_steps(Some(true)), Share::Repos, false)
+                .steps
+                .len(),
+            1
+        );
+        assert!(
+            redact(with_steps(Some(true)), Share::Repos, true)
+                .steps
+                .is_empty()
+        );
+        assert!(
+            redact(with_steps(Some(false)), Share::Totals, true)
+                .steps
+                .is_empty()
+        );
     }
 
     #[test]

@@ -386,6 +386,10 @@ Every job is written to a ledger on the machine that ran it (`~/.home-runner/job
 - repo, workflow, job, run link, who triggered it, event, branch and commit
 - when it started, how long it took and how long it waited in GitHub's queue
 - the result, and CPU used
+- each step's duration (from GitHub, so it needs the app's "Actions: Read" permission)
+- peak memory, and on Linux disk bytes read and written
+- cache use: whether `/cache` started warm, how big each cache directory (`cargo`, `sccache`, `pnpm-store`, `npm`, `turbo`) was before and after, and sccache hits and misses
+- how long the runner took to register, launch and become ready
 - what the same job would have cost on the closest GitHub-hosted and Depot runners
 
 ```console
@@ -402,7 +406,8 @@ $ home-runner savings --by repo          # or --by actor | pool | host | workflo
   ...
 ```
 
-- `--repo`, `--actor`, `--since 24h|7d|4w|all` filter either command.
+- `--repo`, `--actor`, `--since 24h|7d|4w|all` filter these commands.
+- `home-runner profile` turns the step, cache, memory and startup data into a report of where time goes: slowest jobs, warm versus cold cache durations, sccache hit rate, how much each cache grew per run (what had to be downloaded or built), the slowest steps and runner startup. `--job build` narrows it to matching workflows or jobs, `--format json` exports it.
 - `--format csv|json` exports for spreadsheets or dashboards.
 - To combine machines by hand, copy each machine's ledger and pass them all, e.g. `--ledger mini.jsonl --ledger pc.jsonl`. To do it automatically across houses, see [Fleet](#fleet-several-houses-one-dashboard).
 - With `annotate_jobs = true`, each workflow run also shows a notice such as *"Ran on studio-m2. About $0.79 saved vs GitHub macOS 3-core M1 (13 billable min)."*
@@ -410,6 +415,8 @@ $ home-runner savings --by repo          # or --by actor | pool | host | workflo
 **How the numbers are estimated**
 
 - **Job details:** GitHub's runner job hooks (`ACTIONS_RUNNER_HOOK_JOB_STARTED/COMPLETED`) run small scripts inside each job. They record the `GITHUB_*` variables and sample CPU counters, and they never fail the job.
+- **Caches:** the job's end hook sizes each directory under `/cache` (capped at 15 s) and saves the result in `/cache/.hr-sizes`, which the next job on that slot reads as its starting point. A job counts as warm if `/cache` held at least 50 MiB when it started; a slot with no cache disk is always cold. sccache counters come from `sccache --show-stats` when a server ran during the job.
+- **Memory:** peak of "used" memory (Linux `MemTotal - MemAvailable`; on macOS anonymous + wired + compressed pages), sampled every 5 s, so a shorter spike can be missed.
 - **CPU:**
   - Apple container VMs: the VM's `/proc/stat`.
   - Docker: the container's cgroup.
@@ -505,7 +512,7 @@ Fleet reporting is outbound HTTPS too. You'd only need inbound access for webhoo
 | `home-runner drain` / `resume` | Stop taking jobs for maintenance (`drain --wait` waits for running jobs), and start again |
 | `home-runner selftest` | Brings up a runner per pool, checks GitHub sees it, and checks teardown leaves nothing behind |
 | `home-runner prereq inspect` / `install` | Check a pool's job prerequisites in a real worker; build what's missing (see above) |
-| `home-runner jobs` / `savings` | Job log and savings report (see above) |
+| `home-runner jobs` / `savings` / `profile` | Job log, savings report, and where time goes (see above) |
 | `home-runner ui` | Desktop app: running jobs, history, savings stats, fleet, settings. On a Mac, `install`/`setup` also adds it as Home Runner.app in /Applications |
 | `home-runner setup` | Link `home-runner` into `~/.local/bin` (and your zsh PATH) and install the Mac app; part of `install` |
 | `home-runner doctor` | Checks auth, tooling, images and job prerequisites, warns about weak isolation, and prints labels |

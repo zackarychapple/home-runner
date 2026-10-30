@@ -561,15 +561,21 @@ async fn run_runner(
     shutdown: &CancellationToken,
     stop: &CancellationToken,
 ) -> Result<Outcome> {
+    let registering = Instant::now();
     let jit = ctx
         .gh
         .generate_jitconfig(name, &pool.labels, pool.cfg.runner_group_id)
         .await
         .context("registering runner with GitHub")?;
+    let register_secs = registering.elapsed().as_secs_f64();
     ctx.github_ok();
     info!(runner = %name, "registered, waiting for a job");
 
-    let result = drive(ctx, pool, slot, name, &jit.encoded, shutdown, stop).await;
+    let registration = Registration {
+        jit_config: &jit.encoded,
+        register_secs,
+    };
+    let result = drive(ctx, pool, slot, name, &registration, shutdown, stop).await;
 
     if let Err(e) = pool.backend.cleanup(name).await {
         warn!(runner = %name, "cleanup failed, reconcile will retry: {e:#}");
@@ -646,20 +652,29 @@ pub(crate) async fn ensure_prereqs(
     Ok(true)
 }
 
+/// A runner's registration with GitHub, as `drive` needs it.
+struct Registration<'a> {
+    jit_config: &'a str,
+    /// How long registering took, for the ledger.
+    register_secs: f64,
+}
+
 async fn drive(
     ctx: &Ctx,
     pool: &Pool,
     slot: usize,
     name: &str,
-    jit_config: &str,
+    registration: &Registration<'_>,
     shutdown: &CancellationToken,
     stop: &CancellationToken,
 ) -> Result<Outcome> {
     let launched = Instant::now();
+    let launched_at = SystemTime::now();
     let mut running = tokio::select! {
-        r = pool.backend.launch(name, jit_config, &pool.hook_env) => r.context("launching runner")?,
+        r = pool.backend.launch(name, registration.jit_config, &pool.hook_env) => r.context("launching runner")?,
         _ = shutdown.cancelled() => return Ok(Outcome::Shutdown),
     };
+    let launch_secs = launched.elapsed().as_secs_f64();
     ctx.live.watch(&pool.cfg.name, slot, running.watch.clone());
     ctx.slots.phase(&pool.cfg.name, slot, Phase::Idle);
 
@@ -764,6 +779,20 @@ async fn drive(
             info.result = Some(forced.unwrap_or("Unknown").to_string());
         }
         info.meta.extend(pool.backend.collect(name).await);
+        // Hook-reported values are only ever added; these are the supervisor's own timings.
+        let mut timing = vec![
+            ("register_secs", registration.register_secs),
+            ("launch_secs", launch_secs),
+        ];
+        if let Some(ready) = info
+            .listening
+            .and_then(|t| t.duration_since(launched_at).ok())
+        {
+            timing.push(("ready_secs", ready.as_secs_f64()));
+        }
+        for (key, secs) in timing {
+            info.meta.insert(key.into(), format!("{secs:.2}"));
+        }
         ctx.accounting
             .record(name, &pool.cfg, &pool.pricing, info)
             .await;

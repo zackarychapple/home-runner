@@ -9,7 +9,9 @@
 //! CPU modes (`HR_CPU_MODE`): `procstat` (VM-wide /proc/stat jiffies), `usec` (the container's
 //! cgroup), `exe` (`home-runner cpu-sample`: machine-wide counters on macOS and Windows).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
+
+use crate::ledger::{CacheStats, Resources};
 
 pub const MARKER: &str = "::home-runner:: ";
 
@@ -29,6 +31,53 @@ const SH_CPU_FN: &str = r#"hr_cpu() {
 }
 "#;
 
+/// Samplers for the resource and cache numbers in the ledger. Each prints nothing where it can't
+/// measure (no /proc on macOS, no sccache server running), so a missing value is simply absent.
+const SH_STATS_FN: &str = r#"hr_mem() {
+  if [ -r /proc/meminfo ]; then
+    awk '/^MemTotal:/ {t=$2} /^MemAvailable:/ {a=$2} END {if (t) print t-a}' /proc/meminfo
+  elif command -v vm_stat >/dev/null 2>&1; then
+    # What Activity Monitor calls "memory used": app (anonymous) + wired + compressed pages.
+    vm_stat 2>/dev/null | awk '/page size of/ {ps=$8} /^Anonymous pages:/ {a=$3} /^Pages wired down:/ {w=$4} /^Pages occupied by compressor:/ {c=$5} END {if (ps) printf "%.0f\n", (a+w+c)*ps/1024}'
+  fi
+}
+hr_memtotal() {
+  if [ -r /proc/meminfo ]; then
+    awk '/^MemTotal:/ {print $2}' /proc/meminfo
+  else
+    sysctl -n hw.memsize 2>/dev/null | awk '{printf "%.0f\n", $1/1024}'
+  fi
+}
+hr_io() {
+  awk '$3 ~ /^(vd[a-z]+|sd[a-z]+|nvme[0-9]+n[0-9]+)$/ {r+=$6; w+=$10} END {printf "%.0f %.0f\n", r*512, w*512}' /proc/diskstats 2>/dev/null
+}
+hr_sccache() {
+  pgrep -x sccache >/dev/null 2>&1 || return 0
+  sccache --show-stats 2>/dev/null | awk '
+    $1=="Compile" && $2=="requests" && $3 ~ /^[0-9]+$/ {r=$3}
+    $1=="Cache" && $2=="hits" && $3 ~ /^[0-9]+$/ {h=$3}
+    $1=="Cache" && $2=="misses" && $3 ~ /^[0-9]+$/ {m=$3}
+    END {if (r != "") print r+0, h+0, m+0}'
+}
+hr_du() {
+  for n in cargo sccache pnpm-store npm turbo; do
+    [ -d "/cache/$n" ] || continue
+    printf '%s:%s ' "$n" "$(du -sk "/cache/$n" 2>/dev/null | awk '{print $1}')"
+  done
+  echo
+}
+# Sizing a big cache can be slow; give up after 15s and report what finished.
+hr_du_capped() {
+  hr_o="$d/du.out"
+  hr_du > "$hr_o" 2>/dev/null &
+  hr_p=$!
+  hr_i=0
+  while kill -0 "$hr_p" 2>/dev/null && [ "$hr_i" -lt 15 ]; do sleep 1; hr_i=$((hr_i+1)); done
+  kill "$hr_p" 2>/dev/null
+  cat "$hr_o" 2>/dev/null
+}
+"#;
+
 const SH_STARTED: &str = r#"{
   echo "repo=$GITHUB_REPOSITORY"
   echo "workflow=$GITHUB_WORKFLOW"
@@ -45,6 +94,9 @@ const SH_STARTED: &str = r#"{
   echo "ncpu=$(getconf _NPROCESSORS_ONLN 2>/dev/null)"
   echo "cpu_mode=${HR_CPU_MODE:-none}"
   echo "cpu_start=$(hr_cpu)"
+  echo "mem_total_kb=$(hr_memtotal)"
+  echo "io_start=$(hr_io)"
+  echo "sccache_start=$(hr_sccache)"
   echo "hook_start=$(date +%s)"
 } 2>/dev/null > "$d/job.env.tmp"
 # Renamed into place so a reader never sees half a file.
@@ -54,6 +106,8 @@ exit 0
 
 const SH_COMPLETED: &str = r#"{
   echo "cpu_end=$(hr_cpu)"
+  echo "io_end=$(hr_io)"
+  echo "sccache_end=$(hr_sccache)"
   echo "hook_end=$(date +%s)"
 } 2>/dev/null >> "$d/job.env"
 if [ -n "$HR_GH_RATE" ]; then
@@ -112,11 +166,11 @@ exit 0
 "#;
 
 pub fn sh_started() -> String {
-    format!("{SH_COMMON}{SH_CPU_FN}{SH_STARTED}")
+    format!("{SH_COMMON}{SH_CPU_FN}{SH_STATS_FN}{SH_STARTED}")
 }
 
 pub fn sh_completed() -> String {
-    format!("{SH_COMMON}{SH_CPU_FN}{SH_COMPLETED}")
+    format!("{SH_COMMON}{SH_CPU_FN}{SH_STATS_FN}{SH_COMPLETED}")
 }
 
 pub fn ps_started() -> String {
@@ -130,10 +184,20 @@ pub fn ps_completed() -> String {
 /// While the runner waits and works, a background loop prints what the started hook recorded as
 /// soon as it exists, then a CPU sample every few seconds, so the supervisor can show a VM's job
 /// live instead of only after the runner exits. [`SH_EMIT`] stops it.
+///
+/// The same loop tracks peak memory, and once the job has started reads the cache sizes the
+/// previous job left in /cache/.hr-sizes (what this job started with).
 const SH_WATCH: &str = r#"(
   while [ ! -s "$d/job.env" ]; do sleep 2; done
   sed 's/^/::home-runner:: /' "$d/job.env"
-  while :; do echo "::home-runner:: cpu_live=$(hr_cpu) $(date +%s)"; sleep 5; done
+  cat /cache/.hr-sizes > "$d/cache_start" 2>/dev/null
+  peak=0
+  while :; do
+    echo "::home-runner:: cpu_live=$(hr_cpu) $(date +%s)"
+    m=$(hr_mem)
+    if [ "${m:-0}" -gt "$peak" ] 2>/dev/null; then peak=$m; echo "$peak" > "$d/mem_peak"; fi
+    sleep 5
+  done
 ) &
 hr_watch=$!
 "#;
@@ -151,7 +215,7 @@ chmod +x "$d/hooks/started.sh" "$d/hooks/completed.sh"
 export HR_STATE_DIR="$d"
 export ACTIONS_RUNNER_HOOK_JOB_STARTED="$d/hooks/started.sh"
 export ACTIONS_RUNNER_HOOK_JOB_COMPLETED="$d/hooks/completed.sh"
-{SH_CPU_FN}{SH_WATCH}"#,
+{SH_CPU_FN}{SH_STATS_FN}{SH_WATCH}"#,
         sh_started(),
         sh_completed()
     )
@@ -159,8 +223,17 @@ export ACTIONS_RUNNER_HOOK_JOB_COMPLETED="$d/hooks/completed.sh"
 
 /// Stops the watcher and prints the hook output with [`MARKER`] so the supervisor can read it
 /// from the runner's stdout.
+///
+/// Also sizes the cache directories (the next job's starting point is saved in /cache/.hr-sizes)
+/// and reports peak memory.
 pub const SH_EMIT: &str = r#"{ kill "$hr_watch"; wait "$hr_watch"; } 2>/dev/null
-[ -f "$d/job.env" ] && sed 's/^/::home-runner:: /' "$d/job.env""#;
+[ -f "$d/job.env" ] && sed 's/^/::home-runner:: /' "$d/job.env"
+[ -s "$d/mem_peak" ] && echo "::home-runner:: mem_peak_kb=$(cat "$d/mem_peak")"
+[ -s "$d/cache_start" ] && echo "::home-runner:: cache_start=$(cat "$d/cache_start")"
+hr_sz=$(hr_du_capped)
+echo "::home-runner:: cache_end=$hr_sz"
+# Synced because the container or VM is removed right after this.
+[ -n "$hr_sz" ] && echo "$hr_sz" 2>/dev/null > /cache/.hr-sizes && sync"#;
 
 /// Parses `key=value` lines (tolerating a UTF-8 BOM and CRLF from PowerShell).
 pub fn parse_env(text: &str) -> HashMap<String, String> {
@@ -267,6 +340,77 @@ pub fn cpu_usage(meta: &HashMap<String, String>, cpus_limit: u32) -> Option<(f64
     }
 }
 
+/// `/cache` holding at least this much when a job starts counts as warm.
+const WARM_CACHE_KB: u64 = 50 * 1024;
+
+fn numbers(value: Option<&String>) -> Vec<u64> {
+    value
+        .map(|v| {
+            v.split_whitespace()
+                .filter_map(|n| n.parse().ok())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// `cargo:123 pnpm-store:456` as written by the hooks' `hr_du`: KiB per cache directory.
+fn cache_dirs(value: Option<&String>) -> BTreeMap<String, u64> {
+    value
+        .map(|v| {
+            v.split_whitespace()
+                .filter_map(|entry| {
+                    let (name, kb) = entry.rsplit_once(':')?;
+                    Some((name.to_string(), kb.parse().ok()?))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Cache use during the job: whether `/cache` was warm, sccache hits and how big each cache
+/// directory was before and after. `None` if the hooks reported nothing about caches.
+pub fn cache_stats(meta: &HashMap<String, String>) -> Option<CacheStats> {
+    let end_kb = cache_dirs(meta.get("cache_end"));
+    let sccache_end = numbers(meta.get("sccache_end"));
+    if end_kb.is_empty() && sccache_end.len() < 3 {
+        return None;
+    }
+    let start_kb = cache_dirs(meta.get("cache_start"));
+    let mut stats = CacheStats {
+        warm: start_kb.values().sum::<u64>() >= WARM_CACHE_KB,
+        start_kb,
+        end_kb,
+        ..Default::default()
+    };
+    if let [requests, hits, misses] = sccache_end[..] {
+        // Counters are the server's lifetime totals; a server that wasn't running at the start
+        // began from zero. A shorter start means the server restarted, so count from zero too.
+        let start = numbers(meta.get("sccache_start"));
+        let before = |i: usize, end: u64| match start.get(i) {
+            Some(&s) if s <= end => s,
+            _ => 0,
+        };
+        stats.sccache_requests = Some(requests - before(0, requests));
+        stats.sccache_hits = Some(hits - before(1, hits));
+        stats.sccache_misses = Some(misses - before(2, misses));
+    }
+    Some(stats)
+}
+
+/// Peak memory and disk traffic during the job, from the hooks' samples.
+pub fn resources(meta: &HashMap<String, String>) -> Option<Resources> {
+    let number = |key: &str| meta.get(key).and_then(|v| v.trim().parse::<u64>().ok());
+    let (io_start, io_end) = (numbers(meta.get("io_start")), numbers(meta.get("io_end")));
+    let io = |i: usize| io_end.get(i)?.checked_sub(*io_start.get(i)?);
+    let r = Resources {
+        mem_peak_kb: number("mem_peak_kb"),
+        mem_total_kb: number("mem_total_kb"),
+        disk_read_bytes: io(0),
+        disk_write_bytes: io(1),
+    };
+    (r.mem_peak_kb.is_some() || r.disk_read_bytes.is_some()).then_some(r)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -314,6 +458,54 @@ mod tests {
     }
 
     #[test]
+    fn reads_cache_use_from_hook_output() {
+        let m = meta(&[
+            ("cache_start", "cargo:1000 pnpm-store:200000 "),
+            ("cache_end", "cargo:1500 pnpm-store:200400 sccache:900"),
+            ("sccache_start", ""),
+            ("sccache_end", "40 30 10"),
+        ]);
+        let c = cache_stats(&m).unwrap();
+        assert!(c.warm);
+        assert_eq!(c.start_kb["pnpm-store"], 200_000);
+        assert_eq!(c.end_kb["sccache"], 900);
+        assert_eq!((c.sccache_hits, c.sccache_misses), (Some(30), Some(10)));
+
+        // A cold job: nothing was there to start with, and a cumulative counter is differenced.
+        let cold = meta(&[
+            ("cache_end", "cargo:900 "),
+            ("sccache_start", "10 5 5"),
+            ("sccache_end", "30 15 15"),
+        ]);
+        let c = cache_stats(&cold).unwrap();
+        assert!(!c.warm);
+        assert_eq!(c.sccache_requests, Some(20));
+        assert_eq!(c.sccache_misses, Some(10));
+
+        assert!(cache_stats(&meta(&[("cache_end", ""), ("sccache_end", "")])).is_none());
+    }
+
+    #[test]
+    fn reads_resources_from_hook_output() {
+        let m = meta(&[
+            ("mem_total_kb", "16000000"),
+            ("mem_peak_kb", "9000000"),
+            ("io_start", "1000 2000"),
+            ("io_end", "5000 2500"),
+        ]);
+        let r = resources(&m).unwrap();
+        assert_eq!(r.mem_peak_kb, Some(9_000_000));
+        assert_eq!(
+            (r.disk_read_bytes, r.disk_write_bytes),
+            (Some(4000), Some(500))
+        );
+        // macOS has no disk counters but still reports memory.
+        let mac = meta(&[("mem_peak_kb", "100"), ("io_start", ""), ("io_end", "")]);
+        assert_eq!(resources(&mac).unwrap().disk_read_bytes, None);
+        assert!(resources(&meta(&[("mem_total_kb", "1")])).is_none());
+    }
+
+    #[test]
     fn parses_powershell_output() {
         let env = parse_env("\u{feff}repo=acme/app\r\nactor=octocat\r\nworkflow=CI = main\r\n");
         assert_eq!(env["repo"], "acme/app");
@@ -338,6 +530,8 @@ mod dump {
             std::fs::write(dir.join("completed.sh"), super::sh_completed()).unwrap();
             std::fs::write(dir.join("started.ps1"), super::ps_started()).unwrap();
             std::fs::write(dir.join("completed.ps1"), super::ps_completed()).unwrap();
+            std::fs::write(dir.join("install.sh"), super::sh_install_fragment()).unwrap();
+            std::fs::write(dir.join("emit.sh"), super::SH_EMIT).unwrap();
         }
     }
 }

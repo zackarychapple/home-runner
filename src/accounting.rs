@@ -12,10 +12,41 @@ use tracing::{debug, info, warn};
 use crate::config::{PoolConfig, PricingConfig};
 use crate::github::GitHub;
 use crate::hooks;
-use crate::ledger::{self, JobRecord};
+use crate::ledger::{self, JobRecord, Startup, StepRecord};
 use crate::pricing::{self, Pricing, Provider, Sku};
 use crate::proc::JobInfo;
 use crate::timefmt;
+
+/// Step durations from the start and end times GitHub recorded; steps that never ran have none.
+fn steps(steps: &[crate::github::WorkflowStep]) -> Vec<StepRecord> {
+    steps
+        .iter()
+        .map(|s| {
+            let at = |t: &Option<String>| t.as_deref().and_then(timefmt::parse_rfc3339);
+            let secs = match (at(&s.started_at), at(&s.completed_at)) {
+                (Some(start), Some(end)) => (end - start).max(0) as f64,
+                _ => 0.0,
+            };
+            StepRecord {
+                name: s.name.clone(),
+                number: s.number,
+                conclusion: s.conclusion.clone(),
+                secs,
+            }
+        })
+        .collect()
+}
+
+/// How long the runner took to get ready, as the supervisor measured it (see `daemon::drive`).
+fn startup(meta: &HashMap<String, String>) -> Option<Startup> {
+    let secs = |k: &str| meta.get(k).and_then(|v| v.parse::<f64>().ok());
+    let s = Startup {
+        register_secs: secs("register_secs"),
+        launch_secs: secs("launch_secs"),
+        ready_secs: secs("ready_secs"),
+    };
+    (s.launch_secs.is_some() || s.ready_secs.is_some()).then_some(s)
+}
 
 /// The comparable hosted runners for one pool, chosen once at startup.
 pub struct PoolPricing {
@@ -139,11 +170,11 @@ impl Accounting {
             let server = get("server_url").unwrap_or_else(|| "https://github.com".into());
             r.url = Some(format!("{server}/{repo}/actions/runs/{run_id}"));
             match self
-                .gh
-                .find_job(repo, run_id, r.run_attempt.unwrap_or(1), runner)
+                .find_finished_job(repo, run_id, r.run_attempt.unwrap_or(1), runner)
                 .await
             {
                 Ok(Some(job)) => {
+                    r.steps = steps(&job.steps);
                     r.job = Some(job.name);
                     r.url = job.html_url.or(r.url.take());
                     r.queued_secs = job
@@ -164,6 +195,10 @@ impl Accounting {
             r.cpu_utilization = Some(pricing::round_cents(utilization));
         }
 
+        r.cache = hooks::cache_stats(meta);
+        r.resources = hooks::resources(meta);
+        r.startup = startup(meta);
+
         let public = r.repo_private == Some(false);
         r.github = pp
             .github
@@ -178,6 +213,32 @@ impl Accounting {
         r.saved_vs_github_usd = r.github.as_ref().map(|c| pricing::round_cents(c.usd - own));
         r.saved_vs_depot_usd = r.depot.as_ref().map(|c| pricing::round_cents(c.usd - own));
         r
+    }
+
+    /// The job as GitHub has it. The runner can exit a moment before GitHub has closed the job's
+    /// last steps, so look again briefly rather than record a half-finished step list.
+    async fn find_finished_job(
+        &self,
+        repo: &str,
+        run_id: u64,
+        attempt: u32,
+        runner: &str,
+    ) -> anyhow::Result<Option<crate::github::WorkflowJob>> {
+        let mut job = self.gh.find_job(repo, run_id, attempt, runner).await?;
+        for _ in 0..3 {
+            let settled = job.as_ref().is_none_or(|j| {
+                j.status == "completed"
+                    && j.steps.iter().all(|s| {
+                        s.completed_at.is_some() || s.conclusion.as_deref() == Some("skipped")
+                    })
+            });
+            if settled {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            job = self.gh.find_job(repo, run_id, attempt, runner).await?;
+        }
+        Ok(job)
     }
 
     async fn repo_private(&self, repo: &str) -> Option<bool> {
@@ -251,6 +312,7 @@ mod tests {
                 .iter()
                 .map(|(k, v)| (k.to_string(), v.to_string()))
                 .collect(),
+            ..Default::default()
         }
     }
 
