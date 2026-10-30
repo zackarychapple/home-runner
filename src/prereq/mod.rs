@@ -14,6 +14,7 @@
 //! probe output instead of a real worker.
 
 pub mod install;
+pub mod native;
 pub mod probe;
 pub mod run;
 
@@ -70,6 +71,11 @@ pub enum Requirement {
     Docker(DockerReq),
     /// Pinned Playwright versions, their exact browser revisions and OS libraries.
     Playwright(PlaywrightReq),
+    /// The pinned Cargo Tauri CLI, CEF distribution and Apple toolchain on a macOS (Tart) worker.
+    TauriCef(native::TauriCefReq),
+    /// A logged-in graphical session where real keyboard and pointer input is proven to reach an
+    /// app (Tart workers only).
+    MacosGui(native::MacosGuiReq),
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -163,6 +169,8 @@ impl Requirement {
                 }
                 ids
             }
+            Requirement::TauriCef(_) => native::tauri_cef_ids(),
+            Requirement::MacosGui(_) => native::gui_ids(),
         }
     }
 }
@@ -266,6 +274,8 @@ impl ProfileConfig {
                         p.root
                     );
                 }
+                Requirement::TauriCef(r) => r.validate(name)?,
+                Requirement::MacosGui(r) => r.validate(name)?,
             }
             for id in req.check_ids() {
                 ensure!(
@@ -286,6 +296,20 @@ impl ProfileConfig {
             Requirement::Docker(d) => Some(d),
             _ => None,
         })
+    }
+
+    pub fn macos_gui(&self) -> Option<&native::MacosGuiReq> {
+        self.requirements.iter().find_map(|r| match r {
+            Requirement::MacosGui(g) => Some(g),
+            _ => None,
+        })
+    }
+
+    /// Whether any requirement only makes sense on a macOS worker.
+    pub fn needs_macos(&self) -> bool {
+        self.requirements
+            .iter()
+            .any(|r| matches!(r, Requirement::TauriCef(_) | Requirement::MacosGui(_)))
     }
 
     pub fn playwright(&self) -> Option<&PlaywrightReq> {
@@ -377,6 +401,27 @@ impl Provision {
                 profile.name
             );
         }
+        if profile.needs_macos() {
+            ensure!(
+                matches!(
+                    pool.backend,
+                    BackendConfig::Tart(_) | BackendConfig::Host(_)
+                ),
+                "pool {:?}: profile {:?} has macOS native requirements (tauri-cef, macos-gui), so \
+                 it needs a `tart` pool",
+                pool.name,
+                profile.name
+            );
+        }
+        if profile.macos_gui().is_some() {
+            ensure!(
+                matches!(pool.backend, BackendConfig::Tart(_)),
+                "pool {:?}: profile {:?} sends real keyboard and pointer events, which must only \
+                 ever go to a throwaway Tart VM, never the desktop of a `host` pool",
+                pool.name,
+                profile.name
+            );
+        }
         let start_docker = profile.docker().is_some() && oci.is_some();
         let mode = profile.install.unwrap_or(if oci_image.is_some() {
             InstallMode::Image
@@ -445,17 +490,25 @@ impl Provision {
 
     /// Environment the runner passes on to every job.
     pub fn job_env(&self) -> Vec<(String, String)> {
-        match self.profile.playwright() {
-            Some(p) => vec![(
+        let mut env = Vec::new();
+        if let Some(p) = self.profile.playwright() {
+            env.push((
                 "PLAYWRIGHT_BROWSERS_PATH".into(),
                 format!(
                     "{}/{}/browsers",
                     p.root.trim_end_matches('/'),
                     self.platform_key
                 ),
-            )],
-            None => Vec::new(),
+            ));
         }
+        for req in &self.profile.requirements {
+            match req {
+                Requirement::TauriCef(r) => env.extend(r.job_env()),
+                Requirement::MacosGui(g) => env.extend(g.job_env()),
+                _ => {}
+            }
+        }
+        env
     }
 
     pub fn can_install(&self) -> bool {
@@ -601,6 +654,95 @@ pub(crate) mod tests {
         forced.install = Some(InstallMode::Image);
         let err = Provision::new(&forced, &tart, "macOS", "ARM64", "/tmp".into()).unwrap_err();
         assert!(err.to_string().contains("needs a container pool"));
+    }
+
+    const NATIVE: &str = r#"
+        name = "native"
+        [[require]]
+        kind = "command"
+        name = "node"
+        version = "26"
+        [[require]]
+        kind = "tauri-cef"
+        tools_dir = "/opt/home-runner/native/tools"
+        tauri_revision = "78f49ba3993fed5a1b921235c547731006ad2a74"
+        cli_version = "3.0.0-alpha.5"
+        cef_path = "/opt/home-runner/native/cef/dist"
+        cef_archive = "cef_binary_154.0.34+g14c5a08+chromium-154.0.8037.98_macosarm64_minimal.tar.bz2"
+        cef_sha1 = "b7081f6609e5edccf07be96b5d7977329fbe1bdf"
+        [[require]]
+        kind = "macos-gui"
+    "#;
+
+    fn tart_pool() -> PoolConfig {
+        toml::from_str("name = \"mac\"\nbackend = \"tart\"\nimage = \"i\"\nssh_key = \"k\"")
+            .unwrap()
+    }
+
+    #[test]
+    fn native_requirements_export_what_jobs_need_and_are_verified_on_tart() {
+        let p = profile(NATIVE);
+        let prov = Provision::new(&p, &tart_pool(), "macOS", "ARM64", "/tmp".into()).unwrap();
+        assert_eq!(prov.mode, InstallMode::Preinstalled);
+        let env = prov.job_env();
+        let get = |k: &str| env.iter().find(|(n, _)| n == k).map(|(_, v)| v.as_str());
+        assert_eq!(
+            get("WITH_TAP_NATIVE_TOOLS_DIR"),
+            Some("/opt/home-runner/native/tools")
+        );
+        assert_eq!(
+            get("WITH_TAP_CEF_PATH"),
+            Some("/opt/home-runner/native/cef/dist")
+        );
+        assert_eq!(
+            get("HOME_RUNNER_INPUT"),
+            Some("/usr/local/libexec/home-runner/hr-input")
+        );
+    }
+
+    #[test]
+    fn native_requirements_never_land_on_a_container_pool_or_the_hosts_desktop() {
+        let p = profile(NATIVE);
+        let err = Provision::new(&p, &pool(""), "Linux", "ARM64", "/tmp".into()).unwrap_err();
+        assert!(err.to_string().contains("needs a `tart` pool"), "{err}");
+        let host: PoolConfig = toml::from_str("name = \"h\"\nbackend = \"host\"").unwrap();
+        let err = Provision::new(&p, &host, "macOS", "ARM64", "/tmp".into()).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("never the desktop of a `host` pool"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn readiness_is_tied_to_the_pinned_cli_cef_archive_and_helper() {
+        let base = profile(NATIVE);
+        assert_eq!(base.fingerprint(), profile(NATIVE).fingerprint());
+        for (from, to) in [
+            (
+                "78f49ba3993fed5a1b921235c547731006ad2a74",
+                "88f49ba3993fed5a1b921235c547731006ad2a74",
+            ),
+            (
+                "b7081f6609e5edccf07be96b5d7977329fbe1bdf",
+                "c7081f6609e5edccf07be96b5d7977329fbe1bdf",
+            ),
+            (
+                "154.0.34+g14c5a08+chromium-154.0.8037.98",
+                "154.0.35+g14c5a08+chromium-154.0.8037.98",
+            ),
+            ("3.0.0-alpha.5", "3.0.0-alpha.6"),
+        ] {
+            assert_ne!(
+                base.fingerprint(),
+                profile(&NATIVE.replace(from, to)).fingerprint(),
+                "{from}"
+            );
+        }
+        // A new release of the helper changes the revision profiles default to.
+        assert!(base.fingerprint().len() == 64);
+        let gui = base.macos_gui().unwrap();
+        assert_eq!(gui.revision, native::helper_revision());
     }
 
     #[test]

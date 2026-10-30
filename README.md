@@ -235,6 +235,74 @@ home-runner prereq install --dry-run        # show the Dockerfile and install sc
 
 Without `install` access (Tart, host, or `install = "preinstalled"`): install `playwright-core@<version>` under `<root>/runtime/<version>` and run its `cli.js install --with-deps chromium` with `PLAYWRIGHT_BROWSERS_PATH=<root>/<os>-<arch>/browsers` set, as root, then make the tree read-only for everyone else.
 
+**Native macOS workers** (`kind = "tauri-cef"` and `kind = "macos-gui"`, Tart pools only). They verify, in a throwaway Tart worker as the runner user (the probe loads the image's `~/.home-runner/env` first, so it sees what a job sees), everything a Tauri/CEF desktop app needs to build and to be driven with real input. Nothing is installed from a job. `images/macos-latest/build.sh` provisions both into the golden image, and until a worker verifies, the pool is never registered with GitHub:
+
+```toml
+[[profile]]
+name = "native"
+version = 1
+
+[[profile.require]]
+kind = "command"
+name = "node"
+version = "26"
+[[profile.require]]
+kind = "command"
+name = "pnpm"
+version = "10.33.1"
+[[profile.require]]
+kind = "command"
+name = "rustc"
+version = "1.99.0"
+
+[[profile.require]]
+kind = "tauri-cef"
+tools_dir = "/opt/home-runner/native/tools"      # exported as WITH_TAP_NATIVE_TOOLS_DIR (tools_env)
+tauri_revision = "78f49ba3993fed5a1b921235c547731006ad2a74"   # full commit hash, never a branch
+cli_version = "3.0.0-alpha.5"
+cef_path = "/opt/home-runner/native/cef/dist"    # exported as WITH_TAP_CEF_PATH (cef_env)
+cef_archive = "cef_binary_154.0.34+g14c5a08+chromium-154.0.8037.98_macosarm64_minimal.tar.bz2"
+cef_sha1 = "b7081f6609e5edccf07be96b5d7977329fbe1bdf"         # the checksum you approve
+
+[[profile.require]]
+kind = "macos-gui"                               # the helper path is exported as HOME_RUNNER_INPUT
+
+[[pool]]
+name = "native-validation"
+backend = "tart"
+image = "home-runner-macos-native"
+profile = "native"
+# …ssh_key, cache_size, runner_group_id as for any Tart pool. Give signing its own pool.
+```
+
+*Toolchain (`tauri-cef`).* The probe checks, in order: Darwin/arm64 and not under Rosetta; a selected Xcode or Command Line Tools with an accepted license and a macOS SDK; `clang`, `swift`, `cmake`, `ninja`; `rustfmt`, `clippy` and the `aarch64-apple-darwin` standard library; the Cargo Tauri CLI at `<tools_dir>/bin/cargo-tauri` (it must report `cli_version`, and the `tauri-revision` marker must equal `tauri_revision`); and the CEF distribution: `archive.json` must name `cef_archive` with `cef_sha1`, the headers must be that CEF version, the framework must be `arm64`, and the wrapper sources must be there. The archive kept beside the tree is re-hashed against `cef_sha1`, and every extracted file is checked against a manifest made when the image was built, so a truncated or modified tree fails instead of merely "existing". The CLI and CEF trees must be read-only for the runner user, and the worker must hold no code-signing identity (`allow_signing_identities = true` is for a release pool only). Node, pnpm and Rust pins are ordinary `command` requirements, as above. A wrong or missing piece leaves the pool unavailable with the specific repair.
+
+```sh
+./images/macos-latest/build.sh NATIVE=true       # defaults are With TAP's pins; override TAURI_REVISION, CEF_ARCHIVE, CEF_SHA1, ...
+```
+
+`native/install-native.sh` builds the CLI from the pinned revision and records `tauri-revision` only after it identifies as `cli_version`. It downloads CEF only if the archive's SHA-1 matches both `CEF_SHA1` and the one the CEF builds index publishes, extracts it with an `archive.json` and a file manifest, and makes the tree root-owned and read-only. Re-running it changes nothing that already verifies. Changing a pin, the archive or the image changes the pool's readiness identity and empties the slots' cache disks, so build output from the old toolchain is not reused. Keep release pools (and their caches) separate from this validation pool, and keep signing secrets out of the image and profile.
+
+**Native GUI workers** (`kind = "macos-gui"`). Native acceptance posts real macOS keyboard and pointer events (`CGEvent`), which need an interactive, logged-in session and an Accessibility grant for the exact executable that posts them. A freshly compiled helper does not inherit an older helper's grant, so the app owns one stable helper, `hr-input` (`images/macos-latest/gui/`), signed with a stable identity so rebuilding it keeps the grant. The profile points suites at it through `HOME_RUNNER_INPUT`; its commands (`activate`, `key`, `move`, `drag`) match the usual Swift CGEvent helper, `access` reports permission, `selftest` proves delivery, and `exclusive -- <command>` runs a command under the worker's GUI lock so suites in one job cannot fight over focus.
+
+```sh
+./images/macos-latest/gui/make-signing-identity.sh   # once, on the host: a local self-signed identity (kept out of every image)
+./images/macos-latest/build.sh GUI=true NATIVE=true  # opens the VM window and waits for the one-time grant
+```
+
+When it asks, in the VM's window: **System Settings → Privacy & Security → Accessibility**, add and enable `/usr/local/libexec/home-runner/hr-input`. The grant lives in the image, so clones and reboots keep it. TCC and SIP stay on. The build then runs `hr-input selftest` and fails if it cannot prove delivery. The image must log the runner user in automatically (the Cirrus Labs images do; Automatic login needs FileVault off) and the runner user needs passwordless `sudo`, which the helper uses to enter the login session from SSH (`sudo -n launchctl asuser`).
+
+The probe then proves it, in the worker, as the runner user, and reports each failure on its own line so the cause is never "the tests skipped":
+
+| Check | Fails when |
+|---|---|
+| `gui:session` | nobody is logged in at the console, the console belongs to another user, no WindowServer, or the worker is not a VM |
+| `gui:helper` | missing, a different source revision than this `home-runner` (so a new helper release invalidates readiness), a bad signature, or writable by the runner user |
+| `gui:access` | the helper cannot reach the login session from the job context, or Accessibility / event posting is not granted (revoked, or the helper was replaced by a differently signed build) |
+| `gui:input` | the disposable test app could not be activated (focus), or a key press, click or drag was posted but never reached it (delivery) |
+
+`hr-input` refuses to post input anywhere but inside a virtual machine, so a test or an operator can never move the keyboard focus or pointer of a real desktop. `macos-gui` is rejected on `host` pools for the same reason. Each Tart worker is its own VM with its own WindowServer, so two workers running at once cannot steal each other's input focus; within one worker, use `exclusive`.
+
 ### A `macos-latest`-like Tart image with warm caches
 
 `images/macos-latest/` does the same for macOS: it clones Cirrus Labs' macOS + Xcode image, installs Node (in the runner tool cache), pnpm, a pinned Rust toolchain with both Apple targets (for universal builds) and sccache, points the caches at `/cache`, and authorizes your SSH key. It builds a local VM named `home-runner-macos-latest` and needs a free macOS VM slot (macOS allows two VMs at a time), so stop the service or a pool first if two are running.
@@ -468,7 +536,8 @@ Idle containers and VMs use little CPU, but a Tart VM reserves its memory while 
 ## Known limitations and next steps
 
 - **Docker inside Linux jobs:** set `docker_in_job = true` and use an image with `dockerd` (see above). The stock `ghcr.io/actions/actions-runner` image doesn't include one. Add a `docker` requirement to a profile to have the app prove it works.
-- **Prerequisite installs:** the app builds them into images for container pools only; Tart and host pools are verified, not installed (see "Job prerequisites").
+- **Prerequisite installs:** the app builds them into images for container pools only; Tart and host pools are verified, not installed (see "Job prerequisites"). The native Tauri/CEF toolchain and the GUI input helper are provisioned by `images/macos-latest/build.sh NATIVE=true GUI=true`.
+- **Native input in a worker VM** has been verified on this Mac only up to what can run without posting events (the helper compiles, refuses to post outside a VM, and the probe's every state is covered by fixtures). Run `home-runner prereq inspect --pool <native pool>` against a freshly built image to qualify it end to end.
 - **Self-test doesn't run a job.** It proves the runner registers, connects and cleans up; see `selftest`.
 - **Tart golden images:** for speed and reliability, clone the Cirrus Labs image once, install your toolchains, the runner (in `~/actions-runner`) and an SSH key, then point `image` at that local VM and use `ssh_key`.
 - **Intel macOS and Windows jobs** run on the host, not in a VM. Adding a QEMU backend for Windows VMs on Intel Macs would follow the same `Backend` pattern (`src/backend/`).
