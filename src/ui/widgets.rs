@@ -27,8 +27,12 @@ pub fn phase_color(phase: Phase) -> Color32 {
     }
 }
 
+/// The `result` the GUI gives a job that hasn't finished. Never written to the ledger.
+pub const RUNNING: &str = "Running";
+
 pub fn result_color(result: &str) -> Color32 {
     match result {
+        RUNNING => INFO,
         "Succeeded" => OK,
         "Failed" | "TimedOut" | "VmCrashed" => BAD,
         "Interrupted" => WARN,
@@ -268,13 +272,31 @@ pub fn dur(secs: f64) -> String {
     }
 }
 
+/// How long ago something finished, to the minute: nobody needs the seconds of a job that is over.
+/// Only a running job's timer counts seconds (see [`keep_ticking`]).
 pub fn ago(ts: i64) -> String {
     let d = (timefmt::now() - ts).max(0);
     match d {
-        0..=59 => format!("{d}s ago"),
+        0..=59 => "just now".to_string(),
         60..=3599 => format!("{}m ago", d / 60),
         3600..=86399 => format!("{}h ago", d / 3600),
         _ => format!("{}d ago", d / 86400),
+    }
+}
+
+/// How often the window redraws just to keep "5m ago" labels honest.
+pub const IDLE_REDRAW: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Whether the window is minimized, when nothing on it can be seen changing.
+pub fn minimized(ctx: &egui::Context) -> bool {
+    ctx.input(|i| i.viewport().minimized == Some(true))
+}
+
+/// Call from anything that shows a running job's seconds. Redraws once a second while one is
+/// on screen; with none, the window only redraws when data changes or every [`IDLE_REDRAW`].
+pub fn keep_ticking(ctx: &egui::Context) {
+    if !minimized(ctx) {
+        ctx.request_repaint_after(std::time::Duration::from_secs(1));
     }
 }
 
@@ -288,4 +310,26 @@ pub fn reveal(path: &std::path::Path) {
         "xdg-open"
     };
     let _ = std::process::Command::new(program).arg(path).spawn();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ago_never_counts_seconds() {
+        let now = timefmt::now();
+        assert_eq!(ago(now), "just now");
+        assert_eq!(ago(now - 59), "just now");
+        assert_eq!(ago(now - 60), "1m ago");
+        assert_eq!(ago(now - 5 * 60 - 40), "5m ago");
+        assert_eq!(ago(now - 2 * 3600 - 100), "2h ago");
+        assert_eq!(ago(now - 3 * 86400), "3d ago");
+    }
+
+    #[test]
+    fn running_has_its_own_color() {
+        assert_eq!(result_color("Running"), INFO);
+        assert_ne!(result_color("Running"), result_color("Succeeded"));
+    }
 }
