@@ -5,6 +5,7 @@
 #   steps that run `node` before any setup action.
 # - pnpm installed globally (pnpm switches itself to a repo's `packageManager` version if needed).
 # - Rust through rustup with a pinned toolchain preinstalled, plus sccache.
+# - actionlint, for workflows that lint their own workflow files.
 # - A C toolchain, gh, and passwordless sudo (from the base image) for `sudo apt-get` steps.
 # - Docker Engine, compose and buildx, for pools with `docker_in_job = true` (the wrapper starts
 #   dockerd for each job; nothing runs it otherwise). Skip with --build-arg INSTALL_DOCKER=false.
@@ -21,6 +22,7 @@ ARG PNPM_VERSION=10.33.1
 ARG RUST_TOOLCHAIN=1.99.0
 ARG RUST_COMPONENTS="clippy rustfmt"
 ARG SCCACHE_VERSION=0.19.0
+ARG ACTIONLINT_VERSION=1.7.12
 ARG INSTALL_DOCKER=true
 # Extra apt packages workflows would otherwise install on every run.
 ARG APT_PACKAGES="libasound2-dev"
@@ -63,6 +65,9 @@ RUN set -eux; \
     ln -s "$dir/bin/pnpm" "$dir/bin/pnpx" /usr/local/bin/; \
     curl -fsSL "https://github.com/mozilla/sccache/releases/download/v${SCCACHE_VERSION}/sccache-v${SCCACHE_VERSION}-${rust_arch}-unknown-linux-musl.tar.gz" \
       | tar -xz -C /usr/local/bin --strip-components=1 --wildcards '*/sccache'; \
+    curl -fsSL "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/actionlint_${ACTIONLINT_VERSION}_linux_$(dpkg --print-architecture).tar.gz" \
+      | tar -xz -C /usr/local/bin actionlint; \
+    actionlint -version; \
     mkdir -p /cache; \
     chown -R runner:runner "$RUNNER_TOOL_CACHE" /cache
 

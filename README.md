@@ -61,12 +61,13 @@ brew install openai/tools/tart            # macOS jobs (see the note below)
 container system start                    # once, interactively (installs the Linux kernel)
 brew install hudochenkov/sshpass/sshpass  # only if you use ssh_password with Tart
 
-sudo install -m 755 home-runner /usr/local/bin/
-home-runner init                          # writes ~/.home-runner/config.toml for this machine
+chmod +x home-runner && ./home-runner init   # writes ~/.home-runner/config.toml for this machine
 $EDITOR ~/.home-runner/config.toml        # org, app_id, key path; adjust pool sizes
-home-runner doctor
-home-runner install                       # LaunchAgent: starts at login, restarts on crash
+./home-runner doctor
+./home-runner install                     # LaunchAgent: starts at login, restarts on crash
 ```
+
+`install` also finishes the setup: it links `~/.local/bin/home-runner` to the binary you ran, adds `~/.local/bin` to your PATH in `~/.zshenv` if it isn't there (open a new terminal), and puts **Home Runner.app** in `/Applications` (`~/Applications` if that isn't writable), which opens the desktop app from Finder, Spotlight or the Dock. Both point at the binary, so replacing or rebuilding it updates them. Run `home-runner setup` to redo just this part, for example after moving the binary; `home-runner uninstall` removes the link and the app. Without `install` (a headless or Windows machine), put the binary on your PATH yourself, e.g. `sudo install -m 755 home-runner /usr/local/bin/`.
 
 Then, in **System Settings**:
 - Turn on automatic login for this user. The agent runs in your user session, which Tart and Apple container need. Automatic login requires FileVault to be off.
@@ -188,7 +189,8 @@ name = "actionlint"
 version = "1.7.12"
 # Run as root while building the image. It comes from this file and nowhere else.
 install = """
-curl -fsSL https://github.com/rhysd/actionlint/releases/download/v1.7.12/actionlint_1.7.12_linux_arm64.tar.gz \
+case "$(uname -m)" in aarch64|arm64) a=arm64 ;; *) a=amd64 ;; esac
+curl -fsSL "https://github.com/rhysd/actionlint/releases/download/v1.7.12/actionlint_1.7.12_linux_$a.tar.gz" \
   | tar -xz -C /usr/local/bin actionlint
 """
 
@@ -436,7 +438,8 @@ Fleet reporting is outbound HTTPS too. You'd only need inbound access for webhoo
 | `home-runner selftest` | Brings up a runner per pool, checks GitHub sees it, and checks teardown leaves nothing behind |
 | `home-runner prereq inspect` / `install` | Check a pool's job prerequisites in a real worker; build what's missing (see above) |
 | `home-runner jobs` / `savings` | Job log and savings report (see above) |
-| `home-runner ui` | Desktop app: running jobs, history, savings stats, fleet, settings |
+| `home-runner ui` | Desktop app: running jobs, history, savings stats, fleet, settings. On a Mac, `install`/`setup` also adds it as Home Runner.app in /Applications |
+| `home-runner setup` | Link `home-runner` into `~/.local/bin` (and your zsh PATH) and install the Mac app; part of `install` |
 | `home-runner doctor` | Checks auth, tooling, images and job prerequisites, warns about weak isolation, and prints labels |
 | Logs | `~/.home-runner/logs/` or `C:\ProgramData\home-runner\logs\`, rotated daily, kept 14 days. Runner output is included. |
 | `HOME_RUNNER_LOG=debug` | More detail |

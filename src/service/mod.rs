@@ -22,7 +22,11 @@ pub fn install(
     #[cfg(target_os = "macos")]
     {
         let _ = (account, password);
-        launchd::install(&exe, &config_path, &config.log_dir())
+        launchd::install(&exe, &config_path, &config.log_dir())?;
+        // The service is up; failing to reach the CLI or the app from outside is worth a warning,
+        // not an error that makes the install look as if it hadn't worked.
+        let _ = crate::setup::run(&exe);
+        Ok(())
     }
     #[cfg(windows)]
     {
@@ -40,7 +44,10 @@ pub fn install(
 
 pub fn uninstall() -> Result<()> {
     #[cfg(target_os = "macos")]
-    return launchd::uninstall();
+    {
+        launchd::uninstall()?;
+        crate::setup::remove()
+    }
     #[cfg(windows)]
     return windows::uninstall();
     #[cfg(not(any(target_os = "macos", windows)))]
