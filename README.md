@@ -161,7 +161,7 @@ cache_size = "80G"               # Docker's images and build cache count against
 
 Each job starts its own `dockerd` before the runner and stops it afterwards. With `cache_size`, its images and build cache live in the slot's cache volume, so the second job's `docker pull` and `docker build` are warm. Containers, networks and volumes are cleared at the start of every job, so only images and build cache carry over. If the daemon doesn't answer within 60 seconds the job still runs, with a note in the log, so steps that don't use Docker aren't affected.
 
-- **`apple-container`:** each container is its own VM, so the pool adds the capabilities `dockerd` needs (`CAP_SYS_ADMIN`, `CAP_NET_ADMIN`, `CAP_NET_RAW`, `CAP_MKNOD`, `CAP_SYS_RESOURCE`, `CAP_SETFCAP`) and they stay inside that VM. Bridge and user-defined networks, published ports, `docker build` and the containerd image store work.
+- **`apple-container`:** each container is its own VM, so the pool adds the capabilities `dockerd` needs (`CAP_SYS_ADMIN`, `CAP_NET_ADMIN`, `CAP_NET_RAW`, `CAP_MKNOD`, `CAP_SYS_RESOURCE`, `CAP_SETFCAP`, and `CAP_SYS_PTRACE`, without which `docker exec` fails) and they stay inside that VM. Bridge and user-defined networks, published ports, `docker build` and the containerd image store work.
 - **`docker`:** the container runs `--privileged`, which gives its jobs root on the Docker host VM (Docker Desktop, Colima, OrbStack). Only use it for repos you trust; `home-runner doctor` warns about it. This backend has been run on Docker Desktop for Mac, not yet on Windows.
 - A timeout or shutdown kills the VM without stopping `dockerd` first. It recovers on the next start.
 
@@ -334,7 +334,7 @@ $ home-runner savings --by repo          # or --by actor | pool | host | workflo
 
 - `--repo`, `--actor`, `--since 24h|7d|4w|all` filter either command.
 - `--format csv|json` exports for spreadsheets or dashboards.
-- To report across the whole fleet, copy each machine's ledger and pass them all, e.g. `--ledger mini.jsonl --ledger pc.jsonl`.
+- To combine machines by hand, copy each machine's ledger and pass them all, e.g. `--ledger mini.jsonl --ledger pc.jsonl`. To do it automatically across houses, see [Fleet](#fleet-several-houses-one-dashboard).
 - With `annotate_jobs = true`, each workflow run also shows a notice such as *"Ran on studio-m2. About $0.79 saved vs GitHub macOS 3-core M1 (13 billable min)."*
 
 **How the numbers are estimated**
@@ -350,21 +350,66 @@ $ home-runner savings --by repo          # or --by actor | pool | host | workflo
 - **Not counted:** plan-included free minutes (GitHub Team includes 3,000 per month, Depot plans include some) and hardware cost. GitHub announced, then postponed, a $0.002/min charge for self-hosted runners on private repos; set `github_self_hosted_usd_per_minute` if it ever applies.
 - **Your cost:** electricity only, calculated as `job_watts` × job time × `electricity_usd_per_kwh`.
 
-## Dashboard
+## Desktop app
 
 ```sh
-home-runner ui                                   # this machine's ledger
-home-runner ui --ledger mini.jsonl --ledger pc.jsonl --since 90d   # a whole fleet
+home-runner ui                                   # this machine
+home-runner ui --ledger mini.jsonl --ledger pc.jsonl --since 90d   # Stats over several ledgers
 ```
 
-A native window over the same ledger the `jobs` and `savings` commands read. It is read-only, needs no GitHub credentials, and picks up new jobs within a couple of seconds while it is open.
+A window over this machine's supervisor and its job ledger, and the fleet if it has joined one. Switch between **this machine** and **Fleet** at the top; Active and History show the same things for either.
 
-- **Overview:** saved vs GitHub-hosted and vs Depot, job count, success rate, runner time and your cost; cumulative savings and jobs per day; the success / failed / canceled split; job duration and queue wait (average, median, p95, longest).
-- **Breakdown:** the same totals grouped by repo, actor, workflow, host/pool, host, day or month.
-- **Jobs:** every job, sortable by start, time, queue wait or savings, each linking to its GitHub run.
-- The time range and the repo, actor and host filters at the top apply to all three views. Days are UTC.
+- **Active**: each running job with its repo, workflow, who triggered it and the commit; elapsed time against that job's usual successful run (the bar turns amber when it runs long); live CPU; and money saved so far. Below that, every runner slot (starting, idle, running, backoff with its retry countdown, paused) with its `runs-on` labels. Firing alerts and drain mode show at the top, with **Resume**. **Stop job** kills a job on this machine and records it as Canceled. In fleet view, a warning appears when a platform has no runner online, so its jobs will queue.
+- **History**: totals for the last 24h / 7d / 30d / all, saved per day, and a searchable table filtered by result and pool (or house). Click a row for its trigger, queue wait, what GitHub and Depot would have charged, your power cost and how it compared with its usual run. **Export CSV** saves the filtered rows to Downloads.
+- **Stats**: the ledger dashboard. **Overview** has saved vs GitHub-hosted and vs Depot, job count, success rate, runner time and your cost, cumulative savings and jobs per day; **Breakdown** groups the same totals by repo, actor, workflow, host/pool, host, day or month; **Jobs** is every job, sortable by start, time, queue wait or savings. Its time range and repo, actor and host filters apply to all three. It reads this machine's ledger, or the ones given with `--ledger`, and works without a config or GitHub credentials. Days are UTC.
+- **Fleet**: this month's totals, every house and machine, a coverage grid of runner slots per platform, savings per house, and the state of this machine's reports. Not in a fleet yet? Join one from here.
+- **Settings**: host name, keep-awake, electricity price, pool sizes, and fleet sharing. Saving edits `config.toml` in place (comments and other settings are kept) and refuses an invalid result; **Save & restart** restarts the service. **Run doctor** shows `home-runner doctor`'s output.
 
-Headless machines can skip the GUI dependencies with `cargo build --release --no-default-features`; release binaries include it.
+The app reads `state.json` (see [Health, alerts and upgrades](#health-alerts-and-upgrades)) and the ledger, and asks the supervisor to stop a job by dropping a file in `control/`, so you can open and close it at any time. Release binaries include it; headless machines can skip the GUI dependencies with `cargo build --release --no-default-features`.
+
+Live job details come from the job hooks. In VMs and containers, the hooks print the job's details as soon as it starts and a CPU sample every 5 seconds to the runner's output, which the supervisor reads. On the host backend they are read straight from the job's work directory. For Tart and host jobs, CPU is machine-wide.
+
+## Fleet: several houses, one dashboard
+
+Machines at different people's houses can report to one [Cloudflare Worker](fleet-worker/) backed by D1. Each machine sends a heartbeat every 60 seconds (and soon after each job): its pools, slots and running jobs, plus any new ledger records. Everyone in the fleet sees totals, every house and machine, coverage and a fleet-wide job history, in `home-runner ui` or `home-runner fleet status`.
+
+**Deploy the Worker** (once, by whoever runs the fleet):
+
+```sh
+cd fleet-worker
+npm install
+npx wrangler d1 create home-runner-fleet          # put the printed database_id in wrangler.toml
+npx wrangler d1 migrations apply home-runner-fleet --remote
+npx wrangler secret put ADMIN_TOKEN               # any long random string; only for creating invites
+npx wrangler deploy
+```
+
+Create the fleet and an invite (`uses` and `days` are optional; the defaults are 10 and 7):
+
+```sh
+W=https://home-runner-fleet.<you>.workers.dev
+curl -X POST $W/v1/fleets  -H "Authorization: Bearer $ADMIN_TOKEN" -d '{"name":"friends"}'
+curl -X POST $W/v1/invites -H "Authorization: Bearer $ADMIN_TOKEN" -d '{"fleet":"friends","uses":5}'
+# {"code":"FPDK-3JB9", ...}
+```
+
+**Join from each machine**, then restart the supervisor (`home-runner install` again, or **Save & restart** in the app):
+
+```sh
+home-runner fleet join --url $W --invite FPDK-3JB9 --house "Priya's place" --share repos
+```
+
+This stores the machine's token in `fleet-token` in the data dir (readable only by you) and adds a `[fleet]` section to the config. The Worker keeps only a hash of the token. Joining again from the same host name replaces its token and keeps its history.
+
+**What leaves the machine** is set per machine with `share`, and applied before anything is sent:
+
+| `share` | Sent |
+|---|---|
+| `totals` | Host, pool, platform, start time, duration, result, CPU, and the cost and savings numbers. No repo, workflow or job names. |
+| `repos` (default) | Adds repo, workflow and job names. Private repos (and repos whose visibility couldn't be checked) are sent as a short hash such as `private-c7198fbc19`, unless `hash_private_repos = false`. |
+| `full` | Everything in the ledger, including who triggered the job, event, branch, commit and run link. Best when everyone is in the same GitHub org. |
+
+Reports are sent in order from the ledger, and the supervisor remembers how far it got (`fleet-cursor`). If a machine or the Worker is offline, nothing is lost; the Worker ignores records it already has. A machine counts as offline after missing three heartbeats, and immediately when its supervisor stops cleanly. Savings are credited to the house whose machine ran the job.
 
 ## Network (UniFi)
 
@@ -379,18 +424,19 @@ Recommended UniFi setup:
   - Allow main LAN → CI if you want to manage the machines from your laptop.
 - Optionally, use Ethernet for these machines; macOS VM image pulls are large.
 
-You'd only need inbound access for webhook-driven scale-to-zero, which this design deliberately avoids. Even then, use an outbound tunnel (Cloudflare Tunnel or Tailscale Funnel), not a port forward.
+Fleet reporting is outbound HTTPS too. You'd only need inbound access for webhook-driven scale-to-zero, which this design deliberately avoids. Even then, use an outbound tunnel (Cloudflare Tunnel or Tailscale Funnel), not a port forward.
 
 ## Operations
 
 | | |
 |---|---|
 | `home-runner status` | What each slot is doing, this machine's runners as GitHub sees them, and lifetime savings; `--json` for scripts |
+| `home-runner fleet status` | Fleet totals, houses and machines |
 | `home-runner drain` / `resume` | Stop taking jobs for maintenance (`drain --wait` waits for running jobs), and start again |
 | `home-runner selftest` | Brings up a runner per pool, checks GitHub sees it, and checks teardown leaves nothing behind |
 | `home-runner prereq inspect` / `install` | Check a pool's job prerequisites in a real worker; build what's missing (see above) |
 | `home-runner jobs` / `savings` | Job log and savings report (see above) |
-| `home-runner ui` | Dashboard of savings and job stats (see above) |
+| `home-runner ui` | Desktop app: running jobs, history, savings stats, fleet, settings |
 | `home-runner doctor` | Checks auth, tooling, images and job prerequisites, warns about weak isolation, and prints labels |
 | Logs | `~/.home-runner/logs/` or `C:\ProgramData\home-runner\logs\`, rotated daily, kept 14 days. Runner output is included. |
 | `HOME_RUNNER_LOG=debug` | More detail |

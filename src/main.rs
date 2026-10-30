@@ -3,11 +3,13 @@ mod backend;
 mod config;
 mod daemon;
 mod doctor;
+mod fleet;
 mod github;
 mod health;
 mod hooks;
 mod init;
 mod ledger;
+mod live;
 mod logging;
 mod paths;
 mod power;
@@ -163,7 +165,12 @@ enum Command {
         #[arg(long, value_enum, default_value = "repo")]
         by: ledger::GroupBy,
     },
-    /// Open the dashboard: money saved, job counts and other job stats, updating live.
+    /// Join a shared fleet, or see how it is doing.
+    Fleet {
+        #[command(subcommand)]
+        command: FleetCommand,
+    },
+    /// Open the desktop app: running jobs, history, savings stats, the fleet and settings.
     #[cfg(feature = "ui")]
     Ui {
         #[command(flatten)]
@@ -263,8 +270,12 @@ fn main() -> Result<()> {
             ledger::print_savings(&records, by, &period);
             Ok(())
         }
+        Command::Fleet { command } => runtime()?.block_on(fleet_command(command)),
         #[cfg(feature = "ui")]
-        Command::Ui { config, query } => ui::run(query.paths(&config), query.since),
+        Command::Ui { config, query } => {
+            let ledgers = query.paths(&config);
+            ui::run(config.path(), ledgers, query.since)
+        }
         Command::Prices => {
             print_prices();
             Ok(())
@@ -307,6 +318,31 @@ enum PrereqAction {
     },
 }
 
+#[derive(Subcommand)]
+enum FleetCommand {
+    /// Join with an invite code: stores this machine's token and adds a [fleet] section to the config.
+    Join {
+        #[command(flatten)]
+        config: ConfigArg,
+        /// The fleet's Worker URL, e.g. https://fleet.example.workers.dev
+        #[arg(long)]
+        url: String,
+        #[arg(long)]
+        invite: String,
+        /// Where this machine is, as the rest of the fleet will see it, e.g. "Zack's house".
+        #[arg(long)]
+        house: String,
+        /// How much job detail to share.
+        #[arg(long, value_enum, default_value = "repos")]
+        share: config::Share,
+    },
+    /// Fleet-wide totals, houses and machines.
+    Status {
+        #[command(flatten)]
+        config: ConfigArg,
+    },
+}
+
 #[derive(Args)]
 struct LedgerQuery {
     /// How far back to look: 24h, 7d, 4w, or all.
@@ -345,6 +381,72 @@ impl LedgerQuery {
             actor: self.actor.clone(),
         };
         Ok(filter.apply(ledger::load(&paths)?))
+    }
+}
+
+async fn fleet_command(command: FleetCommand) -> Result<()> {
+    match command {
+        FleetCommand::Join {
+            config,
+            url,
+            invite,
+            house,
+            share,
+        } => {
+            let name =
+                fleet::join_and_configure(&config.path(), &url, &invite, &house, share).await?;
+            println!(
+                "joined fleet {name:?} as {house:?}, sharing {}",
+                share.as_str()
+            );
+            println!("added [fleet] to {}", config.path().display());
+            println!("restart home-runner (`home-runner install` again) to start reporting");
+            Ok(())
+        }
+        FleetCommand::Status { config } => {
+            let config = config::Config::load(&config.path())?;
+            let Some(client) = fleet::Client::from_config(&config)? else {
+                anyhow::bail!("this machine hasn't joined a fleet (see `home-runner fleet join`)");
+            };
+            let view = client.view().await?;
+            let m = &view.month;
+            println!("fleet {}", view.fleet);
+            println!(
+                "  this month: {} jobs, {:.1}h, saved {} vs GitHub ({} vs Depot), power {}",
+                m.jobs,
+                m.runner_secs / 3600.0,
+                ledger::usd(m.saved_vs_github_usd),
+                ledger::usd(m.saved_vs_depot_usd),
+                ledger::usd(m.own_usd)
+            );
+            for house in &view.houses {
+                println!(
+                    "\n  {}  ({} saved this month)",
+                    house.house,
+                    ledger::usd(house.saved_month_usd)
+                );
+                for h in &house.hosts {
+                    let slots: Vec<_> = h.pools.iter().flat_map(|p| &p.slots).collect();
+                    let busy = slots
+                        .iter()
+                        .filter(|s| s.phase == health::Phase::Busy)
+                        .count();
+                    println!(
+                        "    {:<22} {:<8} {}/{} busy  {}",
+                        h.host,
+                        if h.online { "online" } else { "offline" },
+                        busy,
+                        slots.len(),
+                        if h.online {
+                            format!("v{}", h.version)
+                        } else {
+                            format!("last seen {}", timefmt::short(h.last_seen))
+                        }
+                    );
+                }
+            }
+            Ok(())
+        }
     }
 }
 

@@ -22,10 +22,11 @@ pub const DRAIN_FILE: &str = "drain";
 /// A state file older than this means no supervisor is running.
 const STATE_STALE_SECS: i64 = 60;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Phase {
     /// Preparing the backend, registering with GitHub or launching the runner.
+    #[default]
     Starting,
     /// A runner is registered and waiting for a job.
     Idle,
@@ -35,6 +36,22 @@ pub enum Phase {
     Backoff,
     /// Draining: not running anything.
     Paused,
+    /// The machine's supervisor has stopped. Only seen in fleet reports.
+    Offline,
+}
+
+impl Phase {
+    #[cfg_attr(not(feature = "ui"), allow(dead_code))]
+    pub fn label(self) -> &'static str {
+        match self {
+            Phase::Starting => "starting",
+            Phase::Idle => "idle",
+            Phase::Busy => "running",
+            Phase::Backoff => "backoff",
+            Phase::Paused => "paused",
+            Phase::Offline => "offline",
+        }
+    }
 }
 
 impl SlotState {
@@ -45,12 +62,13 @@ impl SlotState {
         match self.phase {
             Phase::Busy | Phase::Paused => true,
             Phase::Idle => self.proven,
-            Phase::Starting | Phase::Backoff => false,
+            Phase::Starting | Phase::Backoff | Phase::Offline => false,
         }
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct SlotState {
     pub pool: String,
     pub slot: usize,
@@ -66,6 +84,12 @@ pub struct SlotState {
     pub consecutive_failures: u32,
     pub last_error: Option<String>,
     pub jobs_done: u64,
+    /// The runner this slot currently owns.
+    pub runner: Option<String>,
+    /// While in backoff: when the next attempt starts.
+    pub retry_at: Option<i64>,
+    /// The job the runner is running, as far as the supervisor knows so far.
+    pub job: Option<crate::live::LiveJob>,
 }
 
 /// Every slot's current state, written by the slot loops and read by the health task.
@@ -85,6 +109,7 @@ impl Slots {
             consecutive_failures: 0,
             last_error: None,
             jobs_done: 0,
+            ..Default::default()
         });
     }
 
@@ -107,6 +132,7 @@ impl Slots {
                 s.phase = phase;
                 s.since = now;
                 s.proven = false;
+                s.retry_at = None;
             }
             // Taking a job proves the runner works.
             if phase == Phase::Busy {
@@ -136,6 +162,11 @@ impl Slots {
         });
     }
 
+    /// When a slot in backoff will try again.
+    pub fn retry_at(&self, pool: &str, slot: usize, at: i64) {
+        self.with(pool, slot, |s| s.retry_at = Some(at));
+    }
+
     pub fn job_done(&self, pool: &str, slot: usize) {
         self.with(pool, slot, |s| {
             s.jobs_done += 1;
@@ -149,7 +180,8 @@ impl Slots {
 }
 
 /// What `state.json` holds.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct State {
     pub version: String,
     pub host: String,
@@ -162,6 +194,43 @@ pub struct State {
     pub slots: Vec<SlotState>,
     /// Alerts currently firing.
     pub alerts: Vec<String>,
+    /// Where runners are registered, e.g. "org acme".
+    pub scope: String,
+    pub electricity_usd_per_kwh: f64,
+    pub job_watts: f64,
+    /// Each pool's settings. Its slots are in `slots`; [`State::pools`] puts them together.
+    pub pools: Vec<PoolState>,
+    pub fleet: Option<FleetStatus>,
+}
+
+/// A pool and, when built by [`State::pools`] or received from the fleet, its slots.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PoolState {
+    pub name: String,
+    pub backend: String,
+    pub labels: Vec<String>,
+    pub os: String,
+    pub arch: String,
+    pub cpus: u32,
+    /// The GitHub-hosted runner jobs are priced against, and its per-minute rate.
+    pub github_label: Option<String>,
+    pub github_usd_per_minute: Option<f64>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub slots: Vec<SlotState>,
+}
+
+/// How fleet reporting is going (see `fleet`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct FleetStatus {
+    pub url: String,
+    pub house: String,
+    pub share: String,
+    pub last_ok_at: Option<i64>,
+    pub last_error: Option<String>,
+    /// Ledger records written but not yet accepted by the fleet.
+    pub pending_records: usize,
 }
 
 impl State {
@@ -171,6 +240,22 @@ impl State {
 
     pub fn busy(&self) -> usize {
         self.slots.iter().filter(|s| s.phase == Phase::Busy).count()
+    }
+
+    /// Pools with their slots.
+    pub fn pools(&self) -> Vec<PoolState> {
+        self.pools
+            .iter()
+            .map(|p| PoolState {
+                slots: self
+                    .slots
+                    .iter()
+                    .filter(|s| s.pool == p.name)
+                    .cloned()
+                    .collect(),
+                ..p.clone()
+            })
+            .collect()
     }
 
     /// Every slot has stopped taking work.
@@ -473,6 +558,7 @@ mod tests {
             consecutive_failures: 4,
             last_error: Some("registering runner with GitHub\nHTTP 500".into()),
             jobs_done: 0,
+            ..Default::default()
         }
     }
 
@@ -642,12 +728,19 @@ mod tests {
                 slot("p", 1, Phase::Busy, 100),
             ],
             alerts: vec![],
+            pools: vec![PoolState {
+                name: "p".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
         };
         write_state(&dir, &state).unwrap();
         let read = read_state(&dir).unwrap();
         assert_eq!(read.pid, 7);
         assert_eq!(read.busy(), 1);
         assert!(!read.drained());
+        let pools = read.pools();
+        assert_eq!(pools[0].slots.len(), 2);
         assert!(read.is_fresh(200 + STATE_STALE_SECS));
         assert!(!read.is_fresh(200 + STATE_STALE_SECS + 1));
 

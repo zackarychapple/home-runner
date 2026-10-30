@@ -1043,6 +1043,15 @@ mod tests {
 
     // Script generation and the shell itself ------------------------------------------------
 
+    /// Set HOME_RUNNER_DUMP to a directory to write the probe script there for manual testing.
+    #[test]
+    fn dump_probe_script() {
+        if let Ok(dir) = std::env::var("HOME_RUNNER_DUMP") {
+            let text = script(&profile(WITH_TAP), "linux-arm64");
+            std::fs::write(std::path::Path::new(&dir).join("probe.sh"), text).unwrap();
+        }
+    }
+
     #[test]
     fn scripts_quote_everything_they_interpolate() {
         let p = profile(

@@ -20,9 +20,11 @@ pub enum OciKind {
     Docker,
 }
 
-/// What `dockerd` needs inside an Apple `container` VM: mounting, netfilter and bridge setup, and
-/// device nodes. Every container is its own VM, so these stay inside it.
+/// What `dockerd` needs inside an Apple `container` VM: mounting, netfilter and bridge setup,
+/// device nodes, and (`CAP_SYS_PTRACE`) `docker exec`, whose `setns` must open another process's
+/// `/proc/<pid>/ns/*`. Every container is its own VM, so these stay inside it.
 const DOCKER_CAPS: &[&str] = &[
+    "CAP_SYS_PTRACE",
     "CAP_SYS_ADMIN",
     "CAP_NET_ADMIN",
     "CAP_NET_RAW",

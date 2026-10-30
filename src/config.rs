@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail, ensure};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::paths;
 use crate::prereq::ProfileConfig;
@@ -22,6 +22,49 @@ pub struct Config {
     pub profiles: Vec<ProfileConfig>,
     #[serde(default, rename = "pool")]
     pub pools: Vec<PoolConfig>,
+    /// Report savings and status to a shared fleet (see `home-runner fleet join`).
+    pub fleet: Option<FleetConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FleetConfig {
+    /// The fleet's Cloudflare Worker, e.g. "https://fleet.example.workers.dev".
+    pub url: String,
+    /// Shown to the rest of the fleet; groups this machine with others in the same place.
+    pub house: String,
+    #[serde(default)]
+    pub share: Share,
+    /// Where the machine token from `fleet join` is kept [default: <data dir>/fleet-token].
+    pub token_file: Option<PathBuf>,
+    /// Send private repo names as a short hash instead of the name.
+    #[serde(default = "default_true")]
+    pub hash_private_repos: bool,
+    #[serde(default = "default_heartbeat")]
+    pub heartbeat_secs: u64,
+}
+
+/// How much job detail this machine shares with the fleet.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
+#[serde(rename_all = "snake_case")]
+pub enum Share {
+    /// Time, results and dollars only: no repo, workflow, people, branches or commits.
+    Totals,
+    /// Adds repo, workflow and job names.
+    #[default]
+    Repos,
+    /// Everything in the ledger, including who triggered each job, branch, commit and run link.
+    Full,
+}
+
+impl Share {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Share::Totals => "totals",
+            Share::Repos => "repos",
+            Share::Full => "full",
+        }
+    }
 }
 
 /// Inputs for the savings estimates in the job ledger.
@@ -274,8 +317,12 @@ impl Config {
                 path.display()
             )
         })?;
-        let config: Config =
-            toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
+        Self::parse(&text).with_context(|| format!("parsing {}", path.display()))
+    }
+
+    /// Parses and validates config text.
+    pub fn parse(text: &str) -> Result<Self> {
+        let config: Config = toml::from_str(text)?;
         config.validate()?;
         Ok(config)
     }
@@ -297,6 +344,14 @@ impl Config {
 
     pub fn ledger_path(&self) -> PathBuf {
         self.data_dir().join(crate::ledger::LEDGER_FILE)
+    }
+
+    pub fn fleet_token_path(&self) -> PathBuf {
+        self.fleet
+            .as_ref()
+            .and_then(|f| f.token_file.as_deref())
+            .map(paths::expand_home)
+            .unwrap_or_else(|| self.data_dir().join("fleet-token"))
     }
 
     pub fn log_dir(&self) -> PathBuf {
@@ -400,6 +455,18 @@ impl Config {
                 );
             }
         }
+        if let Some(fleet) = &self.fleet {
+            ensure!(
+                ["https://", "http://localhost", "http://127.0.0.1"]
+                    .iter()
+                    .any(|p| fleet.url.starts_with(p)),
+                "fleet.url must be an https:// URL"
+            );
+            ensure!(
+                !fleet.house.trim().is_empty(),
+                "fleet.house must not be empty"
+            );
+        }
         // macOS's Virtualization.framework refuses to run more than two macOS guests at once.
         ensure!(
             macos_vms <= 2,
@@ -437,6 +504,9 @@ fn default_job_timeout() -> u64 {
 }
 fn default_true() -> bool {
     true
+}
+fn default_heartbeat() -> u64 {
+    60
 }
 fn default_runner_image() -> String {
     "ghcr.io/actions/actions-runner:latest".into()
