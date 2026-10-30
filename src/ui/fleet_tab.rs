@@ -251,7 +251,11 @@ fn coverage(ui: &mut Ui, snap: &Snapshot) {
                     } else {
                         "offline"
                     };
-                    cells.push((fill, format!("{} · {} · {state}", host.host, pool.name)));
+                    let mut tip = format!("{} · {} · {state}", host.host, pool.name);
+                    if let Some(hold) = pool.paused.as_ref().filter(|_| host.online) {
+                        tip += &format!("\npaused {}", hold.describe());
+                    }
+                    cells.push((fill, tip));
                 }
             }
         }

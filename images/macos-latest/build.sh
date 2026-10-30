@@ -10,6 +10,11 @@
 # (Tauri's DMG window layout does), so a `finder = true` macos-gui pool verifies. PROVISION=false skips the toolchains and only authorizes the key, for a
 # pool that wants Cirrus Labs' image as it is but without the default admin/admin password login:
 #   build.sh IMAGE=home-runner-macos-keyed PROVISION=false Building needs one free macOS VM slot (macOS allows two at a time).
+# DRAIN=true makes the slot: it drains the Tart pools (`home-runner drain --backend tart`, which
+# removes their idle VMs and leaves the other pools taking jobs), waits for their running jobs,
+# builds, and resumes on exit, including on failure. DRAIN_FOR (default 3h) is a safety net: the
+# drain ends by itself if this script is killed. DRAIN_TIMEOUT (default 6h) bounds the wait.
+# HOME_RUNNER and HOME_RUNNER_CONFIG say which binary and config to use.
 set -eu
 cd "$(dirname "$0")"
 BASE=ghcr.io/cirruslabs/macos-tahoe-xcode:latest
@@ -36,6 +41,11 @@ GUI_SIGNING_P12="$HOME/.home-runner/gui-signing.p12"
 GUI_HELPER=/usr/local/libexec/home-runner/hr-input
 # FINDER=true: the runner user may script Finder (Automation), asked for in the VM's window.
 FINDER=false
+DRAIN=false
+DRAIN_FOR=3h
+DRAIN_TIMEOUT=6h
+HOME_RUNNER=home-runner
+HOME_RUNNER_CONFIG=
 GRANT_POLLS=180   # how many 5-second checks to wait for the operator's Accessibility grant
 for arg in "$@"; do
   case "$arg" in
@@ -44,16 +54,35 @@ for arg in "$@"; do
   esac
 done
 
+vm="$IMAGE-building"
+drained=false
+finish() {
+  tart stop "$vm" --timeout 5 >/dev/null 2>&1 || true
+  tart delete "$vm" >/dev/null 2>&1 || true
+  if [ "$drained" = true ]; then
+    # shellcheck disable=SC2086
+    "$HOME_RUNNER" resume $hr_config --backend tart || echo "could not resume the Tart pools; run: $HOME_RUNNER resume --backend tart" >&2
+  fi
+}
+trap finish EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+if [ "$DRAIN" = true ]; then
+  hr_config=""
+  [ -z "$HOME_RUNNER_CONFIG" ] || hr_config="--config $HOME_RUNNER_CONFIG"
+  drained=true   # set first: an interrupt during the wait must still resume
+  # shellcheck disable=SC2086
+  "$HOME_RUNNER" drain $hr_config --backend tart --for "$DRAIN_FOR" --reason "rebuilding the $IMAGE image" \
+    --wait --timeout "$DRAIN_TIMEOUT"
+fi
 running=$(tart list --format json | python3 -c 'import json,sys; print(sum(v["Running"] for v in json.load(sys.stdin)))')
 if [ "$running" -ge 2 ]; then
-  echo "two macOS VMs are already running; stop one (e.g. the home-runner service) first" >&2
+  echo "two macOS VMs are already running; stop one, or run with DRAIN=true to drain the Tart pools first" >&2
   exit 1
 fi
 [ -f "$SSH_KEY" ] || { echo "no public key at $SSH_KEY (set SSH_KEY=...)" >&2; exit 1; }
 
-vm="$IMAGE-building"
 tart delete "$vm" >/dev/null 2>&1 || true
-trap 'tart stop "$vm" --timeout 5 >/dev/null 2>&1; tart delete "$vm" >/dev/null 2>&1' EXIT INT TERM
 tart clone "$BASE" "$vm"
 # The GUI and Finder grants are given by a person, in the VM's own window.
 if [ "$GUI" = true ] || [ "$FINDER" = true ]; then tart run "$vm" >/dev/null 2>&1 & else tart run "$vm" --no-graphics >/dev/null 2>&1 & fi

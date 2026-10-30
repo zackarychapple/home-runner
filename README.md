@@ -369,6 +369,14 @@ A slot counts as down from the time it last had a runner waiting for a job (one 
 
 **Upgrades and maintenance.** `home-runner drain` stops taking jobs: idle runners are deregistered immediately (so GitHub can't hand them a job) and running jobs are left to finish. The request is a flag file, so it survives a restart of the supervisor.
 
+Draining can be partial and temporary. `--pool NAME` (repeatable) or `--backend tart` drains only those pools; the others stay registered and keep taking jobs. A drained pool's idle VMs and containers are removed, so a Tart pool gives its macOS VM slots back (macOS allows two at a time). `--for 2h` ends the drain by itself, so a forgotten one doesn't pause the service for good, and `--reason "rebuilding the macOS image"` says why. `status`, `status --json`, the UI and the fleet view show which pools are paused, since when, why and until when. `resume` takes the same `--pool`/`--backend`; plain `resume` ends every drain.
+
+```sh
+home-runner drain --pool macos --pool native-validation --for 2h --reason "rebuilding the macOS image" --wait
+images/macos-latest/build.sh DRAIN=true FINDER=true   # does the same around the build, and resumes on exit
+home-runner resume --pool macos --pool native-validation
+```
+
 ```sh
 home-runner drain --wait            # returns when no job is running (--timeout 6h by default)
 home-runner uninstall               # or rebuild an image, change the config, reboot…
@@ -522,7 +530,7 @@ Fleet reporting is outbound HTTPS too. You'd only need inbound access for webhoo
 |---|---|
 | `home-runner status` | What each slot is doing, this machine's runners as GitHub sees them, and lifetime savings; `--json` for scripts |
 | `home-runner fleet status` | Fleet totals, houses and machines |
-| `home-runner drain` / `resume` | Stop taking jobs for maintenance (`drain --wait` waits for running jobs), and start again |
+| `home-runner drain` / `resume` | Stop taking jobs for maintenance, for the whole machine or some pools (`--pool`, `--backend`), optionally `--for` a while and with a `--reason`; `drain --wait` waits for running jobs |
 | `home-runner selftest` | Brings up a runner per pool, checks GitHub sees it, and checks teardown leaves nothing behind |
 | `home-runner prereq inspect` / `install` | Check a pool's job prerequisites in a real worker; build what's missing (see above) |
 | `home-runner jobs` / `savings` / `profile` | Job log, savings report, and where time goes (see above) |

@@ -78,8 +78,8 @@ pub struct Ctx {
     /// Names of runners a slot is currently responsible for. Reconcile never touches these.
     active: Mutex<HashSet<String>>,
     pub slots: Slots,
-    /// `true` while draining: slots deregister idle runners and don't start new ones.
-    pub drain: watch::Sender<bool>,
+    /// What is drained: those pools' slots deregister idle runners and don't start new ones.
+    pub drain: watch::Sender<health::Drain>,
     /// Unix time GitHub last answered an API call.
     github_ok_at: AtomicI64,
     pub timing: Timing,
@@ -100,7 +100,7 @@ impl Ctx {
             host_prefix,
             active: Mutex::default(),
             slots: Slots::default(),
-            drain: watch::channel(false).0,
+            drain: watch::channel(health::Drain::default()).0,
             github_ok_at: AtomicI64::new(timefmt::now()),
             timing: Timing::default(),
             live: Live::default(),
@@ -276,7 +276,8 @@ pub async fn run(config: Config, shutdown: CancellationToken) -> Result<()> {
     } = build(&config)?;
     let ctx = Arc::new(Ctx::new(gh, accounting, config.runner_prefix()));
     let data_dir = config.data_dir();
-    ctx.drain.send_replace(health::drain_requested(&data_dir));
+    ctx.drain
+        .send_replace(health::read_drain(&data_dir, timefmt::now()));
     info!(
         host = %config.host_name(),
         scope = %ctx.gh.scope_label(),
@@ -381,6 +382,7 @@ async fn monitor(
             cpus: p.pricing.cpus,
             github_label: p.pricing.github.map(|s| s.label.to_string()),
             github_usd_per_minute: p.pricing.github.map(|s| rate(s.id, s.usd_per_minute)),
+            paused: None,
             slots: vec![],
         })
         .collect();
@@ -401,21 +403,19 @@ async fn monitor(
             _ = ticker.tick() => {}
             _ = shutdown.cancelled() => return,
         }
-        let draining = health::drain_requested(&data_dir);
-        if ctx.drain.send_replace(draining) != draining {
-            info!(
-                "{}",
-                if draining {
-                    "draining: no new jobs will start"
-                } else {
-                    "resumed"
-                }
-            );
+        let now = timefmt::now();
+        if let Err(e) = health::expire_drain(&data_dir, now) {
+            warn!("{e:#}");
         }
+        let drain = health::read_drain(&data_dir, now);
+        let before = ctx.drain.send_replace(drain.clone());
+        if before != drain {
+            info!("{}", describe_drain(&drain));
+        }
+        let draining = drain.all.is_some();
 
         ctx.live.take_stop_requests(&data_dir);
 
-        let now = timefmt::now();
         let ticks = hooks::cpu_ticks();
         let host_cpu = match (last_ticks, ticks) {
             (Some((b0, t0)), Some((b1, t1))) if t1 > t0 => {
@@ -472,6 +472,7 @@ async fn monitor(
             started_at,
             updated_at: now,
             draining,
+            drain,
             github_ok_at,
             slots,
             alerts: health.firing(),
@@ -488,16 +489,31 @@ async fn monitor(
     }
 }
 
+/// The log line for a change in what is drained.
+fn describe_drain(drain: &health::Drain) -> String {
+    if drain.is_empty() {
+        return "resumed".into();
+    }
+    let mut parts = Vec::new();
+    if let Some(hold) = &drain.all {
+        parts.push(format!("all pools ({})", hold.describe()));
+    }
+    for (pool, hold) in &drain.pools {
+        parts.push(format!("pool {pool} ({})", hold.describe()));
+    }
+    format!("draining: no new jobs will start in {}", parts.join("; "))
+}
+
 pub async fn slot_loop(ctx: Arc<Ctx>, pool: Arc<Pool>, slot: usize, shutdown: CancellationToken) {
     let timing = ctx.timing;
     let name = pool.cfg.name.as_str();
     let mut backoff = timing.min_backoff;
     let mut drain = ctx.drain.subscribe();
     while !shutdown.is_cancelled() {
-        if *drain.borrow() {
+        if drain.borrow().hold_for(name).is_some() {
             ctx.slots.phase(name, slot, Phase::Paused);
             tokio::select! {
-                _ = drain.wait_for(|draining| !*draining) => {}
+                _ = drain.wait_for(|d| d.hold_for(name).is_none()) => {}
                 _ = shutdown.cancelled() => break,
             }
             continue;
@@ -518,7 +534,7 @@ pub async fn slot_loop(ctx: Arc<Ctx>, pool: Arc<Pool>, slot: usize, shutdown: Ca
                 backoff = (backoff * 2).min(timing.max_backoff);
                 tokio::select! {
                     _ = tokio::time::sleep(delay) => {}
-                    _ = drain.wait_for(|draining| *draining) => {}
+                    _ = drain.wait_for(|d| d.hold_for(name).is_some()) => {}
                     _ = shutdown.cancelled() => break,
                 }
             }
@@ -710,7 +726,7 @@ async fn drive(
         let mut drain = ctx.drain.subscribe();
         async move {
             loop {
-                if *drain.borrow() && !probe.has_started() {
+                if drain.borrow().hold_for(&pool.cfg.name).is_some() && !probe.has_started() {
                     return;
                 }
                 tokio::select! {
@@ -848,7 +864,8 @@ pub async fn status(path: &Path, json: bool) -> Result<()> {
     let gh = GitHub::from_config(&config.github)?;
     let prefix = config.runner_prefix();
     let local = health::read_state(&config.data_dir()).filter(|s| s.is_fresh(timefmt::now()));
-    let draining = health::drain_requested(&config.data_dir());
+    let drain = health::read_drain(&config.data_dir(), timefmt::now());
+    let draining = drain.all.is_some();
     let runners = gh.list_runners().await.map(|mut runners| {
         runners.retain(|r| r.name.starts_with(&prefix));
         runners.sort_by(|a, b| a.name.cmp(&b.name));
@@ -859,7 +876,14 @@ pub async fn status(path: &Path, json: bool) -> Result<()> {
         let pools: Vec<_> = config
             .pools
             .iter()
-            .map(|p| serde_json::json!({ "name": p.name, "backend": p.backend.kind(), "count": p.count }))
+            .map(|p| {
+                serde_json::json!({
+                    "name": p.name,
+                    "backend": p.backend.kind(),
+                    "count": p.count,
+                    "paused": drain.hold_for(&p.name),
+                })
+            })
             .collect();
         let github = match &runners {
             Ok(runners) => serde_json::json!({
@@ -874,6 +898,7 @@ pub async fn status(path: &Path, json: bool) -> Result<()> {
             "host": config.host_name(),
             "scope": gh.scope_label(),
             "draining": draining,
+            "drain": drain,
             "pools": pools,
             "supervisor": local,
             "github": github,
@@ -885,10 +910,13 @@ pub async fn status(path: &Path, json: bool) -> Result<()> {
     println!("host {} → {}", config.host_name(), gh.scope_label());
     for pool in &config.pools {
         println!(
-            "  pool {:<20} {:<16} x{}",
+            "  pool {:<20} {:<16} x{}{}",
             pool.name,
             pool.backend.kind(),
-            pool.count
+            pool.count,
+            drain
+                .hold_for(&pool.name)
+                .map_or(String::new(), |h| format!("  PAUSED {}", h.describe()))
         );
     }
     let ledger = crate::ledger::load(&[config.ledger_path()]).unwrap_or_default();
@@ -909,6 +937,12 @@ pub async fn status(path: &Path, json: bool) -> Result<()> {
                 crate::ledger::duration((now - state.started_at) as f64),
                 if state.draining { ", DRAINING" } else { "" }
             );
+            if let Some(hold) = &drain.all {
+                println!("  all pools drained {}", hold.describe());
+            }
+            for (pool, hold) in &drain.pools {
+                println!("  pool {pool} drained {}", hold.describe());
+            }
             for s in &state.slots {
                 println!(
                     "  {:<20} slot {}  {:<8} for {}{}",
@@ -935,7 +969,7 @@ pub async fn status(path: &Path, json: bool) -> Result<()> {
     if runners.is_empty() {
         println!(
             "no runners registered for this host ({})",
-            if draining {
+            if !drain.is_empty() {
                 "draining"
             } else {
                 "is home-runner running?"
@@ -1217,7 +1251,10 @@ mod tests {
         eventually("idle", || phase(&h) == Phase::Idle).await;
         assert_eq!(h.mock.names().len(), 1);
 
-        h.ctx.drain.send_replace(true);
+        h.ctx.drain.send_replace(health::Drain {
+            all: Some(health::Hold::default()),
+            ..Default::default()
+        });
         eventually("paused", || phase(&h) == Phase::Paused).await;
         assert!(
             h.mock.names().is_empty(),
@@ -1232,9 +1269,39 @@ mod tests {
             "no registrations while draining"
         );
 
-        h.ctx.drain.send_replace(false);
+        h.ctx.drain.send_replace(health::Drain::default());
         eventually("idle again", || phase(&h) == Phase::Idle).await;
         assert_eq!(h.mock.names().len(), 1);
+        stop(shutdown, task).await;
+    }
+
+    #[tokio::test]
+    async fn draining_another_pool_leaves_this_one_taking_jobs() {
+        let h = Harness::new(IDLE).await;
+        let (shutdown, task) = start_slot(&h);
+        eventually("idle", || phase(&h) == Phase::Idle).await;
+
+        let hold = health::Hold::default();
+        let other = health::Drain {
+            pools: [("elsewhere".to_string(), hold.clone())].into(),
+            ..Default::default()
+        };
+        h.ctx.drain.send_replace(other);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(phase(&h), Phase::Idle);
+        assert_eq!(h.mock.names().len(), 1, "still registered");
+
+        let this = health::Drain {
+            pools: [(h.pool.cfg.name.clone(), hold)].into(),
+            ..Default::default()
+        };
+        h.ctx.drain.send_replace(this);
+        eventually("paused", || phase(&h) == Phase::Paused).await;
+        assert!(h.mock.names().is_empty());
+        assert!(
+            h.resources().is_empty(),
+            "the pool's VM or container is gone"
+        );
         stop(shutdown, task).await;
     }
 
@@ -1248,7 +1315,10 @@ mod tests {
         let (shutdown, task) = start_slot(&h);
         eventually("busy", || phase(&h) == Phase::Busy).await;
 
-        h.ctx.drain.send_replace(true);
+        h.ctx.drain.send_replace(health::Drain {
+            all: Some(health::Hold::default()),
+            ..Default::default()
+        });
         eventually("paused after the job", || phase(&h) == Phase::Paused).await;
 
         let records = ledger::load(std::slice::from_ref(&h.ledger)).unwrap();
