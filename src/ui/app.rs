@@ -268,17 +268,16 @@ impl App {
     }
 }
 
-impl eframe::App for App {
-    fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
+impl App {
+    /// Draws the dashboard into the Stats tab.
+    pub fn show(&mut self, ui: &mut Ui) {
         self.poll();
         ui.ctx().request_repaint_after(RELOAD_EVERY);
         let colors = Colors::for_mode(ui.visuals().dark_mode);
 
-        egui::Panel::top("top").show(ui, |ui| {
+        egui::Panel::top("stats-top").show(ui, |ui| {
             ui.add_space(6.0);
             ui.horizontal(|ui| {
-                ui.heading("home-runner");
-                ui.add_space(12.0);
                 for (tab, label) in [
                     (Tab::Overview, "Overview"),
                     (Tab::Breakdown, "Breakdown"),

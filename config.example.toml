@@ -33,6 +33,13 @@ annotate_jobs = true                # post "saved ~$X" on each workflow run
 # [pricing.rates]                   # override list prices; ids from `home-runner prices`
 # github-linux-arm64-4 = 0.008
 
+# Report savings and status to a shared fleet. `home-runner fleet join` writes this for you.
+# [fleet]
+# url = "https://home-runner-fleet.example.workers.dev"
+# house = "Zack's house"
+# share = "repos"                   # totals | repos | full (see README, "Fleet")
+# hash_private_repos = true
+
 # Get a message when a pool can't keep a runner online (and when it recovers).
 # [alerts]
 # webhook_url = "https://hooks.slack.com/services/..."   # or a Discord webhook, ntfy.sh/<topic>, or your own URL

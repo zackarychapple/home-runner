@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::path::Path;
 use std::sync::atomic::{AtomicI64, Ordering};
@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow};
-use tokio::sync::{OnceCell, watch};
+use tokio::sync::{Notify, OnceCell, watch};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
@@ -15,10 +15,10 @@ use crate::accounting::{Accounting, PoolPricing};
 use crate::backend::Backend;
 use crate::config::{Config, PoolConfig};
 use crate::github::GitHub;
-use crate::health::{self, Health, Notifier, Phase, Slots};
-use crate::power;
+use crate::health::{self, FleetStatus, Health, Notifier, Phase, Slots};
+use crate::live::{self, Live};
 use crate::runner_dist::RunnerDist;
-use crate::timefmt;
+use crate::{fleet, hooks, power, timefmt};
 
 /// How the slot loops pace themselves. Tests shrink these.
 #[derive(Clone, Copy)]
@@ -75,6 +75,13 @@ pub struct Ctx {
     /// Unix time GitHub last answered an API call.
     github_ok_at: AtomicI64,
     pub timing: Timing,
+    /// Each slot's current runner and job.
+    pub live: Live,
+    /// Signalled after each job is written to the ledger, so the fleet hears about it soon.
+    pub job_done: Arc<Notify>,
+    fleet: Mutex<Option<FleetStatus>>,
+    /// The state most recently written to `state.json`.
+    latest: Mutex<Option<health::State>>,
 }
 
 impl Ctx {
@@ -88,11 +95,27 @@ impl Ctx {
             drain: watch::channel(false).0,
             github_ok_at: AtomicI64::new(timefmt::now()),
             timing: Timing::default(),
+            live: Live::default(),
+            job_done: Arc::new(Notify::new()),
+            fleet: Mutex::default(),
+            latest: Mutex::default(),
         }
     }
 
     fn github_ok(&self) {
         self.github_ok_at.store(timefmt::now(), Ordering::Relaxed);
+    }
+
+    pub fn latest_state(&self) -> Option<health::State> {
+        self.latest.lock().unwrap().clone()
+    }
+
+    pub fn update_fleet_status(&self, f: impl FnOnce(&mut FleetStatus)) {
+        f(self
+            .fleet
+            .lock()
+            .unwrap()
+            .get_or_insert_with(Default::default));
     }
 }
 
@@ -240,9 +263,21 @@ pub async fn run(config: Config, shutdown: CancellationToken) -> Result<()> {
     let monitor = tokio::spawn(monitor(
         ctx.clone(),
         config.clone(),
+        pools.clone(),
         data_dir.clone(),
         shutdown.clone(),
     ));
+
+    let reporter = match fleet::Reporter::new(&config, ctx.clone()) {
+        Ok(Some(reporter)) => Some(tokio::spawn(
+            reporter.run(ctx.job_done.clone(), shutdown.clone()),
+        )),
+        Ok(None) => None,
+        Err(e) => {
+            warn!("fleet reporting is off: {e:#}");
+            None
+        }
+    };
 
     let reconciler = {
         let (ctx, pools, shutdown) = (ctx.clone(), pools.clone(), shutdown.clone());
@@ -271,18 +306,38 @@ pub async fn run(config: Config, shutdown: CancellationToken) -> Result<()> {
     }
     reconciler.abort();
     monitor.abort();
+    if let Some(reporter) = reporter {
+        let _ = tokio::time::timeout(Duration::from_secs(15), reporter).await;
+    }
     health::remove_state(&data_dir);
     info!("stopped");
     Ok(())
 }
 
-/// Once per tick: pick up drain requests, publish `state.json`, and send alerts.
+/// Once per tick: pick up drain and stop requests, publish `state.json`, and send alerts.
 async fn monitor(
     ctx: Arc<Ctx>,
     config: Config,
+    pools: Vec<Arc<Pool>>,
     data_dir: std::path::PathBuf,
     shutdown: CancellationToken,
 ) {
+    let rate = |id: &str, list: f64| config.pricing.rates.get(id).copied().unwrap_or(list);
+    let pool_info: Vec<health::PoolState> = pools
+        .iter()
+        .map(|p| health::PoolState {
+            name: p.cfg.name.clone(),
+            backend: p.cfg.backend.kind().into(),
+            labels: p.labels.clone(),
+            os: p.pricing.os.clone(),
+            arch: p.pricing.arch.clone(),
+            cpus: p.pricing.cpus,
+            github_label: p.pricing.github.map(|s| s.label.to_string()),
+            github_usd_per_minute: p.pricing.github.map(|s| rate(s.id, s.usd_per_minute)),
+            slots: vec![],
+        })
+        .collect();
+    let mut last_ticks = hooks::cpu_ticks();
     let host = config.host_name();
     let started_at = timefmt::now();
     let mut health = Health::new(&host, &config.alerts);
@@ -311,8 +366,45 @@ async fn monitor(
             );
         }
 
+        ctx.live.take_stop_requests(&data_dir);
+
         let now = timefmt::now();
-        let slots = ctx.slots.snapshot();
+        let ticks = hooks::cpu_ticks();
+        let host_cpu = match (last_ticks, ticks) {
+            (Some((b0, t0)), Some((b1, t1))) if t1 > t0 => {
+                Some((b1.wrapping_sub(b0) as f32 / (t1 - t0) as f32).min(1.0))
+            }
+            _ => None,
+        };
+        last_ticks = ticks;
+        let mut slots = ctx.slots.snapshot();
+        for s in &mut slots {
+            let Some(pool) = pools.iter().find(|p| p.cfg.name == s.pool) else {
+                continue;
+            };
+            let Some((runner, info)) = ctx.live.job(&s.pool, s.slot) else {
+                continue;
+            };
+            if let Some(mut info) = info {
+                // Host-backend jobs keep their metadata on disk and share this machine's CPU.
+                let host = matches!(pool.backend, Backend::Host(_));
+                if host {
+                    let extra: HashMap<_, _> = pool.backend.collect(&runner).await;
+                    for (k, v) in extra {
+                        info.meta.entry(k).or_insert(v);
+                    }
+                }
+                let cpu = ctx.live.sample_cpu(
+                    &s.pool,
+                    s.slot,
+                    &info.meta,
+                    pool.pricing.cpus,
+                    host_cpu.filter(|_| host),
+                );
+                s.job = Some(live::live_job(&info, cpu));
+            }
+            s.runner = Some(runner);
+        }
         let github_ok_at = ctx.github_ok_at.load(Ordering::Relaxed);
         for alert in health.evaluate(now, &slots, github_ok_at) {
             if alert.firing {
@@ -336,10 +428,16 @@ async fn monitor(
             github_ok_at,
             slots,
             alerts: health.firing(),
+            scope: ctx.gh.scope_label(),
+            electricity_usd_per_kwh: config.pricing.electricity_usd_per_kwh,
+            job_watts: config.pricing.job_watts,
+            pools: pool_info.clone(),
+            fleet: ctx.fleet.lock().unwrap().clone(),
         };
         if let Err(e) = health::write_state(&data_dir, &state) {
             warn!("{e:#}");
         }
+        *ctx.latest.lock().unwrap() = Some(state);
     }
 }
 
@@ -368,6 +466,8 @@ pub async fn slot_loop(ctx: Arc<Ctx>, pool: Arc<Pool>, slot: usize, shutdown: Ca
                 let delay = backoff + jitter(timing.min_backoff);
                 error!(pool = %pool.cfg.name, slot, "{e:#}; retrying in {}s", delay.as_secs());
                 ctx.slots.failed(name, slot, format!("{e:#}"));
+                ctx.slots
+                    .retry_at(name, slot, timefmt::now() + delay.as_secs() as i64);
                 backoff = (backoff * 2).min(timing.max_backoff);
                 tokio::select! {
                     _ = tokio::time::sleep(delay) => {}
@@ -393,17 +493,33 @@ async fn run_once(
     }
     let name = format!("{}{slot}-{}", pool.prefix, short_id());
     let _claim = Claim::new(&ctx.active, &name);
+    // Cancelled when someone asks to stop this runner's job (see `live::request_stop`).
+    let stop = CancellationToken::new();
+    ctx.live.start(&pool.cfg.name, slot, &name, stop.clone());
+    let result = run_runner(ctx, pool, slot, &name, shutdown, &stop).await;
+    ctx.live.end(&pool.cfg.name, slot);
+    result
+}
+
+async fn run_runner(
+    ctx: &Ctx,
+    pool: &Pool,
+    slot: usize,
+    name: &str,
+    shutdown: &CancellationToken,
+    stop: &CancellationToken,
+) -> Result<Outcome> {
     let jit = ctx
         .gh
-        .generate_jitconfig(&name, &pool.labels, pool.cfg.runner_group_id)
+        .generate_jitconfig(name, &pool.labels, pool.cfg.runner_group_id)
         .await
         .context("registering runner with GitHub")?;
     ctx.github_ok();
     info!(runner = %name, "registered, waiting for a job");
 
-    let result = drive(ctx, pool, slot, &name, &jit.encoded, shutdown).await;
+    let result = drive(ctx, pool, slot, name, &jit.encoded, shutdown, stop).await;
 
-    if let Err(e) = pool.backend.cleanup(&name).await {
+    if let Err(e) = pool.backend.cleanup(name).await {
         warn!(runner = %name, "cleanup failed, reconcile will retry: {e:#}");
     }
     if let Err(e) = ctx.gh.delete_runner(jit.runner_id).await {
@@ -419,17 +535,20 @@ async fn drive(
     name: &str,
     jit_config: &str,
     shutdown: &CancellationToken,
+    stop: &CancellationToken,
 ) -> Result<Outcome> {
     let launched = Instant::now();
     let mut running = tokio::select! {
         r = pool.backend.launch(name, jit_config, &pool.hook_env) => r.context("launching runner")?,
         _ = shutdown.cancelled() => return Ok(Outcome::Shutdown),
     };
+    ctx.live.watch(&pool.cfg.name, slot, running.watch.clone());
     ctx.slots.phase(&pool.cfg.name, slot, Phase::Idle);
 
     enum Event {
         Exited(Result<std::process::ExitStatus>),
         TimedOut,
+        Stopped,
         Shutdown,
         Drained,
     }
@@ -474,6 +593,7 @@ async fn drive(
         status = running.wait() => Event::Exited(status),
         _ = deadline => Event::TimedOut,
         _ = drained_while_idle => Event::Drained,
+        _ = stop.cancelled() => Event::Stopped,
         _ = shutdown.cancelled() => Event::Shutdown,
     };
 
@@ -502,6 +622,11 @@ async fn drive(
             running.kill().await;
             (Ok(Outcome::Completed), Some("TimedOut"))
         }
+        Event::Stopped => {
+            warn!(runner = %name, "stopping job on request");
+            running.kill().await;
+            (Ok(Outcome::Completed), Some("Canceled"))
+        }
         Event::Shutdown => {
             running.kill().await;
             (Ok(Outcome::Shutdown), Some("Interrupted"))
@@ -524,6 +649,7 @@ async fn drive(
         ctx.accounting
             .record(name, &pool.cfg, &pool.pricing, info)
             .await;
+        ctx.job_done.notify_one();
     }
     outcome
 }

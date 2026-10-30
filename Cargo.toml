@@ -14,8 +14,9 @@ publish = false
 anyhow = "1"
 base64 = "0.22"
 clap = { version = "4", features = ["derive"] }
-# Native dashboard (`home-runner ui`); build with --no-default-features for a headless-only binary.
-eframe = { version = "0.37", default-features = false, features = ["default_fonts", "glow"], optional = true }
+# Desktop app (`home-runner ui`); build with --no-default-features for a headless-only binary.
+# `links` lets "Open run" open the browser.
+eframe = { version = "0.37", default-features = false, features = ["default_fonts", "glow", "links"], optional = true }
 egui_extras = { version = "0.37", default-features = false, optional = true }
 egui_plot = { version = "0.38", optional = true }
 gethostname = "1"
@@ -28,6 +29,7 @@ sha2 = { version = "0.10", features = ["oid"] }
 tokio = { version = "1", features = ["full"] }
 tokio-util = "0.7"
 toml = "0.9"
+toml_edit = "0.25"
 tracing = "0.1"
 tracing-appender = "0.2"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
