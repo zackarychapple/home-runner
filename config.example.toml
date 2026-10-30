@@ -64,6 +64,15 @@ annotate_jobs = true                # post "saved ~$X" on each workflow run
 # [[profile.require]]
 # kind = "playwright"
 # versions = ["1.56.1"]
+#
+# A macOS release pool that builds a Tauri DMG needs to script Finder (the window layout); attach
+# this profile to it with `profile = "release-dmg"`. Build the image once with
+# `images/macos-latest/build.sh FINDER=true` (README: Finder scripting).
+# [[profile]]
+# name = "release-dmg"
+# version = 1
+# [[profile.require]]
+# kind = "macos-finder"
 
 # Linux arm64 jobs, one lightweight VM per job via Apple's `container`.
 #   runs-on: [self-hosted, Linux, ARM64]

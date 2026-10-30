@@ -6,7 +6,8 @@
 # Settings: BASE (source image), IMAGE (local VM name), SSH_KEY (public key to authorize), plus the
 # versions in provision.sh. NATIVE=true also provisions the pinned Tauri CLI and CEF (native/), and
 # GUI=true the stable native input helper plus its one-time Accessibility grant (gui/); README:
-# "Native GUI workers". PROVISION=false skips the toolchains and only authorizes the key, for a
+# "Native GUI workers". FINDER=true adds the one-time Automation grant that lets a job script Finder
+# (Tauri's DMG window layout does), so a `finder = true` macos-gui pool verifies. PROVISION=false skips the toolchains and only authorizes the key, for a
 # pool that wants Cirrus Labs' image as it is but without the default admin/admin password login:
 #   build.sh IMAGE=home-runner-macos-keyed PROVISION=false Building needs one free macOS VM slot (macOS allows two at a time).
 set -eu
@@ -33,6 +34,8 @@ CEF_SHA1=b7081f6609e5edccf07be96b5d7977329fbe1bdf
 GUI=false
 GUI_SIGNING_P12="$HOME/.home-runner/gui-signing.p12"
 GUI_HELPER=/usr/local/libexec/home-runner/hr-input
+# FINDER=true: the runner user may script Finder (Automation), asked for in the VM's window.
+FINDER=false
 GRANT_POLLS=180   # how many 5-second checks to wait for the operator's Accessibility grant
 for arg in "$@"; do
   case "$arg" in
@@ -52,8 +55,8 @@ vm="$IMAGE-building"
 tart delete "$vm" >/dev/null 2>&1 || true
 trap 'tart stop "$vm" --timeout 5 >/dev/null 2>&1; tart delete "$vm" >/dev/null 2>&1' EXIT INT TERM
 tart clone "$BASE" "$vm"
-# The GUI grant is given by a person, in the VM's own window.
-if [ "$GUI" = true ]; then tart run "$vm" >/dev/null 2>&1 & else tart run "$vm" --no-graphics >/dev/null 2>&1 & fi
+# The GUI and Finder grants are given by a person, in the VM's own window.
+if [ "$GUI" = true ] || [ "$FINDER" = true ]; then tart run "$vm" >/dev/null 2>&1 & else tart run "$vm" --no-graphics >/dev/null 2>&1 & fi
 ip=$(tart ip "$vm" --wait 180)
 ssh_vm() {
   SSHPASS=admin sshpass -e ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
@@ -101,6 +104,22 @@ if [ "$GUI" = true ]; then
   done
   echo "granted; proving a real keyboard and pointer event reaches a disposable app:"
   ssh_vm "'$GUI_HELPER' selftest" || { echo "the input self-test failed; the image is not usable for native GUI jobs" >&2; exit 1; }
+fi
+if [ "$FINDER" = true ]; then
+  # Same context as a job (ssh), so the grant is made to the same client a job's osascript is.
+  # An unanswered prompt shows up as an AppleEvent timeout (-1712), a refusal as -1743.
+  finder_ask() {
+    ssh_vm "osascript -e 'with timeout of 10 seconds' -e 'tell application \"Finder\" to get name of startup disk' -e 'end timeout'" 2>&1
+  }
+  i=0
+  until finder_ask >/dev/null; do
+    if [ "$i" -eq 0 ]; then
+      echo "In the VM's window: click Allow on \"... wants access to control Finder\" (or System Settings > Privacy & Security > Automation)." >&2
+    fi
+    i=$((i + 1)); [ "$i" -lt "$GRANT_POLLS" ] || { echo "Finder automation was not granted in time: $(finder_ask)" >&2; exit 1; }
+    sleep 5
+  done
+  echo "granted; Finder answers Apple events from an ssh session"
 fi
 ssh_vm 'sudo shutdown -h now' >/dev/null 2>&1 || true
 i=0

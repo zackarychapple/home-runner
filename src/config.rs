@@ -429,7 +429,7 @@ impl Config {
                                 BackendConfig::Tart(_) | BackendConfig::Host(_)
                             ),
                         "pool {:?}: profile {name:?} has macOS native requirements (tauri-cef, \
-                         macos-gui), so it needs a `tart` pool",
+                         macos-gui, macos-finder), so it needs a `tart` pool",
                         pool.name
                     );
                     ensure!(

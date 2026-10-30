@@ -76,6 +76,9 @@ pub enum Requirement {
     /// A logged-in graphical session where real keyboard and pointer input is proven to reach an
     /// app (Tart workers only).
     MacosGui(native::MacosGuiReq),
+    /// The runner user can script Finder over Apple events, as Tauri's DMG window layout does
+    /// (Tart workers; the Automation permission is granted once in the golden image).
+    MacosFinder(native::MacosFinderReq),
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -171,6 +174,7 @@ impl Requirement {
             }
             Requirement::TauriCef(_) => native::tauri_cef_ids(),
             Requirement::MacosGui(_) => native::gui_ids(),
+            Requirement::MacosFinder(_) => native::finder_ids(),
         }
     }
 }
@@ -276,6 +280,7 @@ impl ProfileConfig {
                 }
                 Requirement::TauriCef(r) => r.validate(name)?,
                 Requirement::MacosGui(r) => r.validate(name)?,
+                Requirement::MacosFinder(_) => {}
             }
             for id in req.check_ids() {
                 ensure!(
@@ -307,9 +312,12 @@ impl ProfileConfig {
 
     /// Whether any requirement only makes sense on a macOS worker.
     pub fn needs_macos(&self) -> bool {
-        self.requirements
-            .iter()
-            .any(|r| matches!(r, Requirement::TauriCef(_) | Requirement::MacosGui(_)))
+        self.requirements.iter().any(|r| {
+            matches!(
+                r,
+                Requirement::TauriCef(_) | Requirement::MacosGui(_) | Requirement::MacosFinder(_)
+            )
+        })
     }
 
     pub fn playwright(&self) -> Option<&PlaywrightReq> {
@@ -407,7 +415,7 @@ impl Provision {
                     pool.backend,
                     BackendConfig::Tart(_) | BackendConfig::Host(_)
                 ),
-                "pool {:?}: profile {:?} has macOS native requirements (tauri-cef, macos-gui), so \
+                "pool {:?}: profile {:?} has macOS native requirements (tauri-cef, macos-gui, macos-finder), so \
                  it needs a `tart` pool",
                 pool.name,
                 profile.name

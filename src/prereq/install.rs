@@ -58,7 +58,7 @@ hr_apt() {
             Requirement::Docker(_) => {}
             // macOS-only: Tart images are built by images/macos-latest/build.sh, never by a
             // derived container image.
-            Requirement::TauriCef(_) | Requirement::MacosGui(_) => {}
+            Requirement::TauriCef(_) | Requirement::MacosGui(_) | Requirement::MacosFinder(_) => {}
             Requirement::Playwright(p) => {
                 apt_used = true;
                 let root = p.root.trim_end_matches('/');
