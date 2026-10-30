@@ -14,6 +14,8 @@ pub struct Config {
     pub host: HostConfig,
     #[serde(default)]
     pub pricing: PricingConfig,
+    #[serde(default)]
+    pub alerts: AlertsConfig,
     #[serde(default, rename = "pool")]
     pub pools: Vec<PoolConfig>,
 }
@@ -45,6 +47,41 @@ impl Default for PricingConfig {
             rates: HashMap::new(),
         }
     }
+}
+
+/// Where to send a message when the supervisor can't keep a pool running.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct AlertsConfig {
+    /// Slack/Discord webhook, ntfy topic URL, or any endpoint that accepts a JSON POST.
+    pub webhook_url: Option<String>,
+    pub format: AlertFormat,
+    /// A slot that hasn't had a runner waiting for (or running) a job for this long counts as
+    /// stalled. Backoff between retries tops out at 5 minutes, so anything under 5 is noisy.
+    pub stalled_minutes: u64,
+}
+
+impl Default for AlertsConfig {
+    fn default() -> Self {
+        Self {
+            webhook_url: None,
+            format: AlertFormat::Json,
+            stalled_minutes: 10,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum AlertFormat {
+    /// `{"event": "firing"|"resolved", "host", "key", "message", "time"}`
+    Json,
+    /// `{"text": …}`
+    Slack,
+    /// `{"content": …}`
+    Discord,
+    /// Plain-text body with a `Title` header.
+    Ntfy,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -165,6 +202,14 @@ pub struct OciConfig {
     /// package stores and build caches that should survive from one job to the next. Each slot
     /// owns its volume, so concurrent jobs never share one. Docker ignores the size.
     pub cache_size: Option<String>,
+    /// Run a Docker daemon inside each job's container, so `docker build`, `docker run`,
+    /// `container:` jobs, `services:` and Docker-based actions work. The image must contain
+    /// `dockerd` (images/ubuntu-latest does). With `cache_size`, the daemon's images and layers
+    /// live in the cache volume and stay warm between jobs. Apple `container` VMs get the extra
+    /// capabilities the daemon needs; the `docker` backend runs the container `--privileged`,
+    /// which gives its jobs root on the Docker host VM, so use it only for repos you trust.
+    #[serde(default)]
+    pub docker_in_job: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -386,6 +431,8 @@ mod tests {
         assert!(matches!(config.github.scope().unwrap(), Scope::Org(_)));
         let kinds: Vec<_> = config.pools.iter().map(|p| p.backend.kind()).collect();
         assert_eq!(kinds, ["apple-container", "apple-container", "tart"]);
+        assert_eq!(config.alerts.stalled_minutes, 10);
+        assert!(config.alerts.webhook_url.is_none());
         match &config.pools[1].backend {
             BackendConfig::AppleContainer(oci) => {
                 assert_eq!(oci.arch.as_deref(), Some("amd64"));
@@ -393,5 +440,34 @@ mod tests {
             }
             other => panic!("unexpected backend {other:?}"),
         }
+    }
+
+    fn parse(extra: &str) -> Result<Config> {
+        let text = format!(
+            "[github]\norg = \"o\"\n[github.auth]\ntype = \"token\"\nenv = \"X\"\n{extra}\n\
+             [[pool]]\nname = \"p\"\nbackend = \"docker\"\ndocker_in_job = true\n"
+        );
+        let config: Config = toml::from_str(&text)?;
+        config.validate()?;
+        Ok(config)
+    }
+
+    #[test]
+    fn parses_alerts_and_docker_in_job() {
+        let config = parse(
+            "[alerts]\nwebhook_url = \"https://hooks.example/x\"\nformat = \"slack\"\nstalled_minutes = 15\n",
+        )
+        .unwrap();
+        assert_eq!(config.alerts.format, AlertFormat::Slack);
+        assert_eq!(config.alerts.stalled_minutes, 15);
+        match &config.pools[0].backend {
+            BackendConfig::Docker(oci) => assert!(oci.docker_in_job),
+            other => panic!("unexpected backend {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_unknown_alert_settings() {
+        assert!(parse("[alerts]\nwebook_url = \"typo\"\n").is_err());
     }
 }

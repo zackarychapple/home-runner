@@ -3,8 +3,8 @@
 [![ci](https://github.com/zackarychapple/home-runner/actions/workflows/ci.yml/badge.svg)](https://github.com/zackarychapple/home-runner/actions/workflows/ci.yml)
 [![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-> **Status: alpha.** The supervisor, GitHub integration and host backend have been tested; the Apple
-> `container` and Tart backends and the Windows service have not yet run real jobs. Issues and PRs welcome.
+> **Status: alpha.** The supervisor, GitHub integration, host, Apple `container` and Tart backends have run real
+> jobs on Apple Silicon; the Docker backend and the Windows service have not. Issues and PRs welcome.
 
 Turn spare Macs and PCs into GitHub Actions runners for **Linux, macOS and Windows** jobs.
 
@@ -146,6 +146,23 @@ runs-on: [self-hosted, home, ubuntu-latest]
 
 **Caches.** With `cache_size`, each slot gets its own persistent volume (`<pool prefix><slot>-cache`) mounted as the runner's work folder (`/home/runner/_work`) with `/cache` linking into it, and the image points the pnpm store, npm cache, Cargo registry, sccache and Turbo cache at it. The work folder is on the volume too, so checkouts are incremental fetches and pnpm hardlinks from its store instead of copying. If the repo uses Turbo, list `CARGO_HOME`, `RUSTC_WRAPPER` and `SCCACHE_*` in `globalPassThroughEnv`, or Turbo's strict env mode hides them from Cargo. Jobs after the first start warm without any `actions/cache` round trips, so skip those on self-hosted runners (`if: runner.environment == 'github-hosted'`). A slot owns its volume, so concurrent jobs never write to the same one. When a volume passes 85% full it's emptied before the next job and that job starts cold. To reset by hand: `container volume rm <name>` while the service is stopped.
 
+**Docker inside jobs.** Steps that run `docker build` or `docker run`, `container:` jobs, `services:` and Docker-based actions need a Docker daemon in the job's VM. Set `docker_in_job = true` on the pool and use an image that has `dockerd` (the `ubuntu-latest` image above installs Docker Engine, compose and buildx; `--build-arg INSTALL_DOCKER=false` leaves it out):
+
+```toml
+[[pool]]
+name = "ubuntu-latest"
+backend = "apple-container"
+docker_in_job = true
+cache_size = "80G"               # Docker's images and build cache count against this
+# …as above
+```
+
+Each job starts its own `dockerd` before the runner and stops it afterwards. With `cache_size`, its images and build cache live in the slot's cache volume, so the second job's `docker pull` and `docker build` are warm. Containers, networks and volumes are cleared at the start of every job, so only images and build cache carry over. If the daemon doesn't answer within 60 seconds the job still runs, with a note in the log, so steps that don't use Docker aren't affected.
+
+- **`apple-container`:** each container is its own VM, so the pool adds the capabilities `dockerd` needs (`CAP_SYS_ADMIN`, `CAP_NET_ADMIN`, `CAP_NET_RAW`, `CAP_MKNOD`, `CAP_SYS_RESOURCE`, `CAP_SETFCAP`) and they stay inside that VM. Bridge and user-defined networks, published ports, `docker build` and the containerd image store work.
+- **`docker`:** the container runs `--privileged`, which gives its jobs root on the Docker host VM (Docker Desktop, Colima, OrbStack). Only use it for repos you trust; `home-runner doctor` warns about it. This backend has been run on Docker Desktop for Mac, not yet on Windows.
+- A timeout or shutdown kills the VM without stopping `dockerd` first. It recovers on the next start.
+
 Anything a job leaves in `/cache` is visible to the next job on that slot, so give a cached pool a runner group limited to repos you trust. `runner_group_id` on a pool overrides `github.runner_group_id`. Rebuild the image to pick up new versions.
 
 ### A `macos-latest`-like Tart image with warm caches
@@ -177,6 +194,47 @@ runs-on: [self-hosted, home, macos-latest]
 **Caches.** With `cache_size`, each slot gets a sparse disk image (`~/.home-runner/tart-cache/<pool prefix><slot>-cache.img`) attached to its VM. The VM formats it on first use and mounts it at `/cache`; the pnpm store, Cargo registry, sccache, Turbo cache, CEF downloads (`~/Library/Caches/tauri-cef`), the runner itself and its work folder live there. The work folder is a real directory on the disk (`/Volumes/HRCache/actions-runner/_work`), not a symlink, because `actions/checkout` registers its credentials under the path the runner reports and git only applies them when the path it sees matches. It's a disk rather than a shared folder because build trees are many small files: a shared folder (virtiofs) measured 8–23x slower for that than the VM's own disk, and the cache disk measured the same as the VM's own disk. It's HFS+ because an APFS volume on a VM's internal disk is keyed to that VM's boot disk, which is a fresh clone every job. `actions/checkout` cleans untracked files by default, which deletes build output (`target/`, `node_modules`) from the work folder; use `clean: false` and a `git clean -ffdx -e target -e node_modules` step to keep it. The same 85% rule and trust rule as above apply. To reset by hand, stop the service and delete the image file.
 
 **Keeping release builds trustworthy.** A build cache is keyed by what goes into a build, but its contents are whatever a previous job wrote, so a job from any branch that can reach the pool could leave poisoned objects that a later release build reuses. Give release builds their own pool (so their own cache) in a runner group restricted to the release workflow on your default branch (`restricted_to_workflows` with `selected_workflows` like `org/repo/.github/workflows/release.yml@refs/heads/main`). Release builds stay warm, because only release builds write that cache. Keep signing material out of `/cache`: import it into a temporary keychain under `/tmp`, since the work folder (including `$RUNNER_TEMP`) is on the cache.
+
+## Health, alerts and upgrades
+
+The supervisor writes `state.json` next to the ledger every few seconds. `home-runner status` shows each slot's state (starting, idle, busy, backoff, paused), how long it has been in it and its last error; `status --json` prints the same plus GitHub's view for scripts and dashboards.
+
+**Alerts.** Add a webhook and home-runner posts a message when a pool can't keep a runner online, and another when it recovers:
+
+```toml
+[alerts]
+webhook_url = "https://hooks.slack.com/services/…"   # Slack, Discord, ntfy.sh/<topic>, or your own endpoint
+format = "slack"                 # json (default), slack, discord, or ntfy
+stalled_minutes = 10             # how long a slot may go without a working runner
+```
+
+A slot counts as down from the time it last had a runner waiting for a job (one that stays up for two minutes, so a runner that starts and dies in a loop doesn't count) or running one. The alert is per pool, not per slot, and fires once until the pool recovers. A separate alert fires when GitHub's API has stopped answering for the same time. A failure to deliver an alert is logged and doesn't affect runners.
+
+**Upgrades and maintenance.** `home-runner drain` stops taking jobs: idle runners are deregistered immediately (so GitHub can't hand them a job) and running jobs are left to finish. The request is a flag file, so it survives a restart of the supervisor.
+
+```sh
+home-runner drain --wait            # returns when no job is running (--timeout 6h by default)
+home-runner uninstall               # or rebuild an image, change the config, reboot…
+# replace the binary
+home-runner install
+home-runner resume
+```
+
+**Self-test.** `home-runner selftest` checks each pool end to end without needing a workflow: it registers a runner, starts it exactly as the supervisor would, waits for GitHub to report it online, tears it down, and verifies nothing is left on GitHub or in the backend. Run it after upgrading Tart, Apple `container`, Docker or an image, or from `cron`/`launchd` with the service stopped. It exits non-zero on failure.
+
+```console
+$ home-runner selftest --pool macos
+pool macos (tart x1)
+  ✓ backend ready (0.4s)
+  ✓ registered with GitHub (0.5s)
+  ✓ runner started (38.1s)
+  ✓ GitHub sees it online (4.0s)
+  ✓ torn down, nothing left behind (6.2s)
+```
+
+It borrows slot 0 of each pool, so stop the service first (it refuses to run beside it, as `cleanup` does). It doesn't run a job. Whether a job runs is down to your workflows, which can run a trivial job per pool on a schedule using the pool's `runs-on` labels.
+
+**Doctor.** `home-runner doctor` also reads each pool's runner group and warns when its isolation doesn't match what the pool shares: a cached or `host` pool whose group allows public repositories or is open to every repo in the org, a release pool in a group that isn't restricted to specific workflows, a Tart pool using `ssh_password`, a `--privileged` Docker pool, and credential files other users can read. Warnings don't fail it; `--strict` does. (This needs the app to read runner groups; if it can't, doctor says so and skips these checks.)
 
 ## Job log and savings
 
@@ -253,10 +311,12 @@ You'd only need inbound access for webhook-driven scale-to-zero, which this desi
 
 | | |
 |---|---|
-| `home-runner status` | This machine's runners as GitHub sees them (idle/busy), plus lifetime savings |
+| `home-runner status` | What each slot is doing, this machine's runners as GitHub sees them, and lifetime savings; `--json` for scripts |
+| `home-runner drain` / `resume` | Stop taking jobs for maintenance (`drain --wait` waits for running jobs), and start again |
+| `home-runner selftest` | Brings up a runner per pool, checks GitHub sees it, and checks teardown leaves nothing behind |
 | `home-runner jobs` / `savings` | Job log and savings report (see above) |
 | `home-runner ui` | Dashboard of savings and job stats (see above) |
-| `home-runner doctor` | Checks auth, tooling and images, and prints labels |
+| `home-runner doctor` | Checks auth, tooling and images, warns about weak isolation, and prints labels |
 | Logs | `~/.home-runner/logs/` or `C:\ProgramData\home-runner\logs\`, rotated daily, kept 14 days. Runner output is included. |
 | `HOME_RUNNER_LOG=debug` | More detail |
 | `home-runner cleanup` | Removes everything this machine registered or created (stop the service first) |
@@ -283,7 +343,8 @@ Idle containers and VMs use little CPU, but a Tart VM reserves its memory while 
 
 ## Known limitations and next steps
 
-- **Docker inside Linux jobs:** jobs using `container:`, `services:` or Docker-based actions need a Docker daemon inside the job VM, and the stock `ghcr.io/actions/actions-runner` image doesn't run one. Build your own image `FROM` it with your toolchains, and set `image`.
+- **Docker inside Linux jobs:** set `docker_in_job = true` and use an image with `dockerd` (see above). The stock `ghcr.io/actions/actions-runner` image doesn't include one.
+- **Self-test doesn't run a job.** It proves the runner registers, connects and cleans up; see `selftest`.
 - **Tart golden images:** for speed and reliability, clone the Cirrus Labs image once, install your toolchains, the runner (in `~/actions-runner`) and an SSH key, then point `image` at that local VM and use `ssh_key`.
 - **Intel macOS and Windows jobs** run on the host, not in a VM. Adding a QEMU backend for Windows VMs on Intel Macs would follow the same `Backend` pattern (`src/backend/`).
 - **Third-party tools have their own licenses.** home-runner only invokes Tart, Apple `container` and
