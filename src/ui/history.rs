@@ -5,10 +5,10 @@ use std::collections::BTreeMap;
 
 use eframe::egui::{self, Align, Layout, RichText, Sense, Ui, Vec2};
 
+use super::App;
 use super::active::{typical_durations, vs_usual, what};
 use super::data::Snapshot;
 use super::widgets::{self, BAD, MUTED, OK, RUNNING, SUBTLE};
-use super::{App, Scope};
 use crate::health::{PoolState, SlotState};
 use crate::ledger::JobRecord;
 use crate::live::LiveJob;
@@ -51,14 +51,13 @@ pub struct HistoryUi {
     period: Period,
     search: String,
     result: Option<&'static str>,
-    /// Pool (this machine) or house (fleet).
+    /// Pool.
     place: Option<String>,
     open: Option<String>,
 }
 
 struct Row<'a> {
     r: &'a JobRecord,
-    house: Option<&'a str>,
 }
 
 impl Row<'_> {
@@ -70,11 +69,8 @@ impl Row<'_> {
         format!("{}/{}", self.r.host, self.r.id)
     }
 
-    fn place(&self, scope: Scope) -> String {
-        match scope {
-            Scope::Host => self.r.pool.clone(),
-            Scope::Fleet => self.house.unwrap_or("").to_string(),
-        }
+    fn place(&self) -> String {
+        self.r.pool.clone()
     }
 
     fn actor(&self) -> &str {
@@ -153,35 +149,15 @@ fn live_record(
     }
 }
 
-/// Jobs running now with the house they run in (fleet scope only).
-fn running_records(snap: &Snapshot, scope: Scope) -> Vec<(JobRecord, Option<String>)> {
+/// Jobs running now on this machine.
+fn running_records(snap: &Snapshot) -> Vec<JobRecord> {
     let now = timefmt::now();
     let mut out = Vec::new();
-    match scope {
-        Scope::Host => {
-            if let Some(state) = snap.state.as_ref().filter(|_| snap.daemon_running()) {
-                for pool in state.pools() {
-                    for slot in &pool.slots {
-                        if let Some(job) = &slot.job {
-                            out.push((live_record(&state.host, &pool, slot, job, now), None));
-                        }
-                    }
-                }
-            }
-        }
-        Scope::Fleet => {
-            if let Some(view) = &snap.fleet {
-                for house in &view.houses {
-                    for host in house.hosts.iter().filter(|h| h.online) {
-                        for pool in &host.pools {
-                            for slot in &pool.slots {
-                                if let Some(job) = &slot.job {
-                                    let record = live_record(&host.host, pool, slot, job, now);
-                                    out.push((record, Some(house.house.clone())));
-                                }
-                            }
-                        }
-                    }
+    if let Some(state) = snap.state.as_ref().filter(|_| snap.daemon_running()) {
+        for pool in state.pools() {
+            for slot in &pool.slots {
+                if let Some(job) = &slot.job {
+                    out.push(live_record(&state.host, &pool, slot, job, now));
                 }
             }
         }
@@ -190,34 +166,17 @@ fn running_records(snap: &Snapshot, scope: Scope) -> Vec<(JobRecord, Option<Stri
 }
 
 pub fn show(ui: &mut Ui, app: &mut App, snap: &Snapshot) {
-    let scope = app.scope;
     let h = &mut app.history;
-    let live = running_records(snap, scope);
-    let mut all: Vec<Row> = match scope {
-        Scope::Host => snap.ledger.iter().map(|r| Row { r, house: None }).collect(),
-        Scope::Fleet => snap
-            .fleet_jobs
-            .iter()
-            .map(|j| Row {
-                r: &j.record,
-                house: Some(&j.house),
-            })
-            .collect(),
-    };
-    all.extend(live.iter().map(|(r, house)| Row {
-        r,
-        house: house.as_deref(),
-    }));
-    if scope == Scope::Fleet {
-        all.sort_by_key(|r| r.r.started_at);
-    }
+    let live = running_records(snap);
+    let mut all: Vec<Row> = snap.ledger.iter().map(|r| Row { r }).collect();
+    all.extend(live.iter().map(|r| Row { r }));
     let needle = h.search.trim().to_lowercase();
     // Everything but the period applies to the chart, which always shows 14 days.
     let filtered: Vec<&Row> = all
         .iter()
         .filter(|r| r.matches(&needle))
         .filter(|r| result_matches(h.result, &r.r.result))
-        .filter(|r| h.place.as_ref().is_none_or(|p| *p == r.place(scope)))
+        .filter(|r| h.place.as_ref().is_none_or(|p| *p == r.place()))
         .collect();
     let since = h.period.secs().map(|s| timefmt::now() - s);
     let rows: Vec<&Row> = filtered
@@ -244,11 +203,7 @@ pub fn show(ui: &mut Ui, app: &mut App, snap: &Snapshot) {
         });
     });
 
-    widgets::section(
-        ui,
-        &format!("Jobs · {}", rows.len()),
-        (scope == Scope::Fleet).then(|| "as shared by each machine".into()),
-    );
+    widgets::section(ui, &format!("Jobs · {}", rows.len()), None);
     let mut exported = None;
     ui.horizontal_wrapped(|ui| {
         ui.add(
@@ -271,18 +226,13 @@ pub fn show(ui: &mut Ui, app: &mut App, snap: &Snapshot) {
                     ui.selectable_value(&mut h.result, Some(value), label);
                 }
             });
-        let mut places: Vec<String> = all.iter().map(|r| r.place(scope)).collect();
+        let mut places: Vec<String> = all.iter().map(Row::place).collect();
         places.sort();
         places.dedup();
-        let any = if scope == Scope::Host {
-            "Any pool"
-        } else {
-            "Any house"
-        };
         egui::ComboBox::from_id_salt("place")
-            .selected_text(h.place.clone().unwrap_or_else(|| any.into()))
+            .selected_text(h.place.clone().unwrap_or_else(|| "Any pool".into()))
             .show_ui(ui, |ui| {
-                ui.selectable_value(&mut h.place, None, any);
+                ui.selectable_value(&mut h.place, None, "Any pool");
                 for p in places {
                     ui.selectable_value(&mut h.place, Some(p.clone()), p);
                 }
@@ -301,7 +251,7 @@ pub fn show(ui: &mut Ui, app: &mut App, snap: &Snapshot) {
         None => {}
     }
     ui.add_space(6.0);
-    table(ui, &mut app.history, snap, scope, &rows);
+    table(ui, &mut app.history, snap, &rows);
 }
 
 fn kpis(ui: &mut Ui, rows: &[&Row], period: Period) {
@@ -386,7 +336,7 @@ const COLS: [(&str, f32); 8] = [
     ("Saved", 64.0),
 ];
 
-fn table(ui: &mut Ui, h: &mut HistoryUi, snap: &Snapshot, scope: Scope, rows: &[&Row]) {
+fn table(ui: &mut Ui, h: &mut HistoryUi, snap: &Snapshot, rows: &[&Row]) {
     if rows.is_empty() {
         ui.label(RichText::new("No jobs match.").color(MUTED));
         return;
@@ -402,11 +352,7 @@ fn table(ui: &mut Ui, h: &mut HistoryUi, snap: &Snapshot, scope: Scope, rows: &[
 
     ui.horizontal(|ui| {
         for (i, (name, _)) in COLS.iter().enumerate() {
-            let name = if i == 3 {
-                if scope == Scope::Host { "Pool" } else { "Host" }
-            } else {
-                name
-            };
+            let name = if i == 3 { "Pool" } else { name };
             cell(ui, widths[i], right(i), |ui| {
                 ui.label(RichText::new(name).size(11.5).color(MUTED));
             });
@@ -440,11 +386,7 @@ fn table(ui: &mut Ui, h: &mut HistoryUi, snap: &Snapshot, scope: Scope, rows: &[
                     ui.label(row.actor());
                 });
                 cell(ui, widths[3], false, |ui| {
-                    ui.label(if scope == Scope::Host {
-                        &r.pool
-                    } else {
-                        &r.host
-                    });
+                    ui.label(&r.pool);
                 });
                 cell(ui, widths[4], false, |ui| {
                     ui.label(RichText::new(widgets::ago(r.started_at)).color(MUTED))
@@ -686,10 +628,10 @@ mod tests {
             state: Some(state),
             ..Default::default()
         };
-        let running = running_records(&snap, Scope::Host);
+        let running = running_records(&snap);
         assert_eq!(running.len(), 1);
-        let (r, house) = &running[0];
-        assert_eq!((r.result.as_str(), house.as_deref()), (RUNNING, None));
+        let r = &running[0];
+        assert_eq!(r.result.as_str(), RUNNING);
         assert_eq!((r.host.as_str(), r.pool.as_str()), ("studio", "linux"));
         assert_eq!(r.repo.as_deref(), Some("acme/app"));
         assert!((90.0..95.0).contains(&r.duration_secs));
@@ -704,7 +646,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        assert!(running_records(&stale, Scope::Host).is_empty());
+        assert!(running_records(&stale).is_empty());
     }
 
     #[test]
@@ -719,10 +661,7 @@ mod tests {
             started_at: timefmt::now(),
             ..Default::default()
         };
-        let row = Row {
-            r: &rec,
-            house: None,
-        };
+        let row = Row { r: &rec };
         let snap = Snapshot::default();
         let mut h = HistoryUi::default();
         let at = Pos2::new(400.0, 42.0);
@@ -733,7 +672,7 @@ mod tests {
                 ..Default::default()
             };
             let mut out = ctx.run_ui(input, |ui| {
-                table(ui, h, &snap, Scope::Host, &[&row]);
+                table(ui, h, &snap, &[&row]);
             });
             out.textures_delta.clear();
         };

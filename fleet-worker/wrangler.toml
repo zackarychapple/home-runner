@@ -1,6 +1,11 @@
 name = "home-runner-fleet"
 main = "src/index.ts"
 compatibility_date = "2026-10-01"
+workers_dev = true
+
+[vars]
+# Shown on the dashboard and in `home-runner fleet status`.
+FLEET_NAME = "home-runner"
 
 [[d1_databases]]
 binding = "DB"
@@ -9,4 +14,7 @@ database_name = "home-runner-fleet"
 database_id = "00000000-0000-0000-0000-000000000000"
 migrations_dir = "migrations"
 
-# Set with `wrangler secret put ADMIN_TOKEN`; it is only used to create fleets and invites.
+# Secrets (set each with `wrangler secret put <NAME>`; see README, "Fleet"):
+#   ENROLL_KEY   lets a machine join the fleet
+#   VIEW_KEY     lets the dashboard read the fleet
+#   ADMIN_TOKEN  lets you remove a machine

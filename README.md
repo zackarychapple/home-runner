@@ -430,7 +430,7 @@ $ home-runner savings --by repo          # or --by actor | pool | host | workflo
 - `--repo`, `--actor`, `--since 24h|7d|4w|all` filter these commands.
 - `home-runner profile` turns the step, cache, memory and startup data into a report of where time goes: slowest jobs, warm versus cold cache durations, sccache hit rate, how much each cache grew per run (what had to be downloaded or built), the slowest steps and runner startup. `--job build` narrows it to matching workflows or jobs, `--format json` exports it.
 - `--format csv|json` exports for spreadsheets or dashboards.
-- To combine machines by hand, copy each machine's ledger and pass them all, e.g. `--ledger mini.jsonl --ledger pc.jsonl`. To do it automatically across houses, see [Fleet](#fleet-several-houses-one-dashboard).
+- To combine machines by hand, copy each machine's ledger and pass them all, e.g. `--ledger mini.jsonl --ledger pc.jsonl`. To do it automatically across houses, see [Fleet](#fleet-a-shared-leaderboard).
 - With `annotate_jobs = true`, each workflow run also shows a notice such as *"Ran on studio-m2. About $0.79 saved vs GitHub macOS 3-core M1 (13 billable min)."*
 
 **How the numbers are estimated**
@@ -455,21 +455,31 @@ home-runner ui                                   # this machine
 home-runner ui --ledger mini.jsonl --ledger pc.jsonl --since 90d   # Stats over several ledgers
 ```
 
-A window over this machine's supervisor and its job ledger, and the fleet if it has joined one. Switch between **this machine** and **Fleet** at the top; Active and History show the same things for either.
+A window over this machine's supervisor and its job ledger, and the fleet leaderboard if it has joined one. Job details stay on the machine: Active, History and Stats show this machine's jobs only.
 
-- **Active**: each running job with its repo, workflow, who triggered it and the commit; elapsed time against that job's usual successful run (the bar turns amber when it runs long); live CPU; and money saved so far. Below that, every runner slot (starting, idle, running, backoff with its retry countdown, paused) with its `runs-on` labels. Firing alerts and drain mode show at the top, with **Resume**. **Stop job** kills a job on this machine and records it as Canceled. In fleet view, a warning appears when a platform has no runner online, so its jobs will queue.
-- **History**: totals for the last 24h / 7d / 30d / all, saved per day, and a searchable table filtered by result and pool (or house). Click a row for its trigger, queue wait, what GitHub and Depot would have charged, your power cost and how it compared with its usual run. **Export CSV** saves the filtered rows to Downloads.
+- **Active**: each running job with its repo, workflow, who triggered it and the commit; elapsed time against that job's usual successful run (the bar turns amber when it runs long); live CPU; and money saved so far. Below that, every runner slot (starting, idle, running, backoff with its retry countdown, paused) with its `runs-on` labels. Firing alerts and drain mode show at the top, with **Resume**. **Stop job** kills a job on this machine and records it as Canceled.
+- **History**: totals for the last 24h / 7d / 30d / all, saved per day, and a searchable table filtered by result and pool. Click a row for its trigger, queue wait, what GitHub and Depot would have charged, your power cost and how it compared with its usual run. **Export CSV** saves the filtered rows to Downloads.
 - **Stats**: the ledger dashboard. **Overview** has saved vs GitHub-hosted and vs Depot, job count, success rate, runner time and your cost, cumulative savings and jobs per day; **Breakdown** groups the same totals by repo, actor, workflow, host/pool, host, day or month; **Jobs** is every job, sortable by start, time, queue wait or savings. Its time range and repo, actor and host filters apply to all three. It reads this machine's ledger, or the ones given with `--ledger`, and works without a config or GitHub credentials. Days are UTC.
-- **Fleet**: this month's totals, every house and machine, a coverage grid of runner slots per platform, savings per house, and the state of this machine's reports. Not in a fleet yet? Join one from here.
-- **Settings**: host name, keep-awake, electricity price, pool sizes, and fleet sharing. Saving edits `config.toml` in place (comments and other settings are kept) and refuses an invalid result; **Save & restart** restarts the service. **Run doctor** shows `home-runner doctor`'s output.
+- **Fleet**: this month's and all-time totals, every house and machine with its pools and open slots, a coverage grid of runner slots per platform (with a warning when a platform has no runner online, so its jobs will queue), savings per house and machine, and the state of this machine's reports. Not in a fleet yet? Join one from here.
+- **Settings**: host name, keep-awake, electricity price, pool sizes, and the fleet house name. Saving edits `config.toml` in place (comments and other settings are kept) and refuses an invalid result; **Save & restart** restarts the service. **Run doctor** shows `home-runner doctor`'s output.
 
 The app reads `state.json` (see [Health, alerts and upgrades](#health-alerts-and-upgrades)) and the ledger, and asks the supervisor to stop a job by dropping a file in `control/`, so you can open and close it at any time. Release binaries include it; headless machines can skip the GUI dependencies with `cargo build --release --no-default-features`.
 
 Live job details come from the job hooks. In VMs and containers, the hooks print the job's details as soon as it starts and a CPU sample every 5 seconds to the runner's output, which the supervisor reads. On the host backend they are read straight from the job's work directory. For Tart and host jobs, CPU is machine-wide.
 
-## Fleet: several houses, one dashboard
+## Fleet: a shared leaderboard
 
-Machines at different people's houses can report to one [Cloudflare Worker](fleet-worker/) backed by D1. Each machine sends a heartbeat every 60 seconds (and soon after each job): its pools, slots and running jobs, plus any new ledger records. Everyone in the fleet sees totals, every house and machine, coverage and a fleet-wide job history, in `home-runner ui` or `home-runner fleet status`.
+Machines at different people's houses can report to one [Cloudflare Worker](fleet-worker/) backed by D1, and a small [dashboard](dashboard/) shows the result: every machine, whether it is online, its pools and how many runner slots are open or busy, and what each one has saved, ranked. It is a leaderboard, not a job monitor: **no job details ever leave a machine**. For repos, workflows, logs and failures, use `home-runner ui` on the machine itself.
+
+Each machine sends a snapshot every 60 seconds (and soon after each job): its host and house name, OS, architecture and CPUs, per pool the runner type and how many slots are idle, busy or not ready, and its totals (jobs, runner time and estimated savings, for all time and per UTC day). The totals come from the machine's own job ledger. The Worker keeps only the latest snapshot per machine, so repeats and retries never double count, and a machine's totals never go down if its ledger is lost.
+
+Three secrets control access. Keep them in one 1Password item (generate each with `openssl rand -base64 32`):
+
+| Secret | Who uses it | For |
+|---|---|---|
+| `ENROLL_KEY` | whoever sets up a machine | `home-runner fleet join`; swapped for a per-machine token |
+| `VIEW_KEY` | the dashboard | reading the fleet |
+| `ADMIN_TOKEN` | you | removing a machine |
 
 **Deploy the Worker** (once, by whoever runs the fleet):
 
@@ -478,36 +488,43 @@ cd fleet-worker
 npm install
 npx wrangler d1 create home-runner-fleet          # put the printed database_id in wrangler.toml
 npx wrangler d1 migrations apply home-runner-fleet --remote
-npx wrangler secret put ADMIN_TOKEN               # any long random string; only for creating invites
-npx wrangler deploy
+for name in ENROLL_KEY VIEW_KEY ADMIN_TOKEN; do
+  op read "op://Fleet/home-runner/$name" | npx wrangler secret put $name
+done
+npx wrangler deploy                               # prints https://home-runner-fleet.<you>.workers.dev
 ```
 
-Create the fleet and an invite (`uses` and `days` are optional; the defaults are 10 and 7):
+`FLEET_NAME` in `wrangler.toml` is the name shown on the dashboard. To run it locally, put the three secrets in `fleet-worker/.dev.vars` and use `npx wrangler dev`.
+
+**Deploy the dashboard** to [Zephyr](https://zephyr-cloud.io):
 
 ```sh
-W=https://home-runner-fleet.<you>.workers.dev
-curl -X POST $W/v1/fleets  -H "Authorization: Bearer $ADMIN_TOKEN" -d '{"name":"friends"}'
-curl -X POST $W/v1/invites -H "Authorization: Bearer $ADMIN_TOKEN" -d '{"fleet":"friends","uses":5}'
-# {"code":"FPDK-3JB9", ...}
+cd dashboard
+npm install
+echo "VITE_FLEET_URL=https://home-runner-fleet.<you>.workers.dev" > .env.local
+npm run deploy                                    # vite build, then upload to Zephyr (asks you to log in)
 ```
 
-**Join from each machine**, then restart the supervisor (`home-runner install` again, or **Save & restart** in the app):
+`npm run build` makes the same static build in `dist/` without uploading it. The page asks for the view key the first time and remembers it in that browser. Open `https://<dashboard>/#k=<VIEW_KEY>` to sign a browser in with one click; the key is in the URL fragment, which is never sent to any server, and the page removes it from the address bar. Don't put the key in the build: everything in the page is public.
+
+**Join each machine**, then restart the supervisor (`home-runner install` again, or **Save & restart** in the app):
 
 ```sh
-home-runner fleet join --url $W --invite FPDK-3JB9 --house "Priya's place" --share repos
+home-runner fleet join --url https://home-runner-fleet.<you>.workers.dev \
+  --key "$(op read op://Fleet/home-runner/ENROLL_KEY)" --house "Priya's place"
 ```
 
-This stores the machine's token in `fleet-token` in the data dir (readable only by you) and adds a `[fleet]` section to the config. The Worker keeps only a hash of the token. Joining again from the same host name replaces its token and keeps its history.
+This stores the machine's own token in `fleet-token` in the data dir (readable only by you) and adds a `[fleet]` section to the config. The enroll key is only used for that one request and is not kept on the machine. The Worker keeps only a hash of the token. Joining again from the same host name replaces its token and keeps its totals.
 
-**What leaves the machine** is set per machine with `share`, and applied before anything is sent:
+**Remove a machine** (its token stops working, and it leaves the leaderboard): `curl -X DELETE -H "Authorization: Bearer $ADMIN_TOKEN" $W/v1/machines/<host>`. To rotate a key, `wrangler secret put` it again: a new `VIEW_KEY` signs everyone out of the dashboard, and a new `ENROLL_KEY` doesn't affect machines that already joined.
 
-| `share` | Sent |
-|---|---|
-| `totals` | Host, pool, platform, start time, duration, result, CPU, and the cost and savings numbers. No repo, workflow or job names. |
-| `repos` (default) | Adds repo, workflow and job names. Private repos (and repos whose visibility couldn't be checked) are sent as a short hash such as `private-c7198fbc19`, unless `hash_private_repos = false`. |
-| `full` | Everything in the ledger, including who triggered the job, event, branch, commit and run link. Best when everyone is in the same GitHub org. |
+A machine counts as offline after missing three heartbeats, and immediately when its supervisor stops cleanly. If you upgraded from an earlier version that sent job records, `share` and `hash_private_repos` in `[fleet]` are ignored and can be deleted.
 
-Reports are sent in order from the ledger, and the supervisor remembers how far it got (`fleet-cursor`). If a machine or the Worker is offline, nothing is lost; the Worker ignores records it already has. A machine counts as offline after missing three heartbeats, and immediately when its supervisor stops cleanly. Savings are credited to the house whose machine ran the job.
+**Deploy from CI.** `.github/workflows/deploy-fleet.yml` applies the migrations, deploys the Worker and deploys the dashboard whenever `fleet-worker/` or `dashboard/` change on `main`. It needs two secrets (`CLOUDFLARE_API_TOKEN` with Workers Scripts and D1 edit, and `ZE_SECRET_TOKEN` from Zephyr) and three repository variables (`CLOUDFLARE_ACCOUNT_ID`, `D1_DATABASE_ID`, `FLEET_URL`). The Worker's own keys stay in Cloudflare, not in GitHub.
+
+**Releases.** `release-please` keeps a release PR open from the conventional commits on `main` (`feat:`, `fix:`, ...). Merging it tags the release and builds the binaries.
+
+**Cost.** This fits Cloudflare's free plan with room to spare: a machine uses about 1,440 Worker requests and D1 writes a day, and the free plan allows 100,000 of each, so roughly 50 machines. On the free plan, going over a limit makes requests fail until 00:00 UTC rather than billing you, and machines simply report again later. Workers Paid ($5/month) removes that ceiling.
 
 ## Network (UniFi)
 
@@ -529,6 +546,7 @@ Fleet reporting is outbound HTTPS too. You'd only need inbound access for webhoo
 | | |
 |---|---|
 | `home-runner status` | What each slot is doing, this machine's runners as GitHub sees them, and lifetime savings; `--json` for scripts |
+| `home-runner fleet join` | Join the fleet leaderboard (see Fleet) |
 | `home-runner fleet status` | Fleet totals, houses and machines |
 | `home-runner drain` / `resume` | Stop taking jobs for maintenance, for the whole machine or some pools (`--pool`, `--backend`), optionally `--for` a while and with a `--reason`; `drain --wait` waits for running jobs |
 | `home-runner selftest` | Brings up a runner per pool, checks GitHub sees it, and checks teardown leaves nothing behind |

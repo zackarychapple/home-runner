@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail, ensure};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 
 use crate::paths;
 use crate::prereq::ProfileConfig;
@@ -33,38 +33,17 @@ pub struct FleetConfig {
     pub url: String,
     /// Shown to the rest of the fleet; groups this machine with others in the same place.
     pub house: String,
-    #[serde(default)]
-    pub share: Share,
     /// Where the machine token from `fleet join` is kept [default: <data dir>/fleet-token].
     pub token_file: Option<PathBuf>,
-    /// Send private repo names as a short hash instead of the name.
-    #[serde(default = "default_true")]
-    pub hash_private_repos: bool,
     #[serde(default = "default_heartbeat")]
     pub heartbeat_secs: u64,
-}
-
-/// How much job detail this machine shares with the fleet.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
-#[serde(rename_all = "snake_case")]
-pub enum Share {
-    /// Time, results and dollars only: no repo, workflow, people, branches or commits.
-    Totals,
-    /// Adds repo, workflow and job names.
-    #[default]
-    Repos,
-    /// Everything in the ledger, including who triggered each job, branch, commit and run link.
-    Full,
-}
-
-impl Share {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Share::Totals => "totals",
-            Share::Repos => "repos",
-            Share::Full => "full",
-        }
-    }
+    /// Deprecated and ignored: reports carry counts and totals, never job details. Still accepted
+    /// so a config written by an older version keeps loading.
+    #[serde(default)]
+    pub share: Option<String>,
+    /// Deprecated and ignored, like `share`.
+    #[serde(default)]
+    pub hash_private_repos: Option<bool>,
 }
 
 /// Inputs for the savings estimates in the job ledger.
@@ -646,5 +625,22 @@ mod tests {
     #[test]
     fn rejects_unknown_alert_settings() {
         assert!(parse("[alerts]\nwebook_url = \"typo\"\n").is_err());
+    }
+
+    #[test]
+    fn a_fleet_section_from_an_older_version_still_loads() {
+        let old = "[fleet]\nurl = \"https://fleet.example.workers.dev\"\nhouse = \"H\"\n\
+                   share = \"full\"\nhash_private_repos = false\nheartbeat_secs = 30\n";
+        let fleet = parse(old).unwrap().fleet.unwrap();
+        assert_eq!(fleet.house, "H");
+        assert_eq!(fleet.heartbeat_secs, 30);
+        assert_eq!(fleet.share.as_deref(), Some("full"));
+        assert_eq!(fleet.hash_private_repos, Some(false));
+        // Without them it is just as valid, and typos are still caught.
+        let new = "[fleet]\nurl = \"https://fleet.example.workers.dev\"\nhouse = \"H\"\n";
+        let fleet = parse(new).unwrap().fleet.unwrap();
+        assert!(fleet.share.is_none() && fleet.hash_private_repos.is_none());
+        assert_eq!(fleet.heartbeat_secs, 60);
+        assert!(parse(&format!("{new}shares = \"x\"\n")).is_err());
     }
 }

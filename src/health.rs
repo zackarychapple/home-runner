@@ -233,11 +233,8 @@ pub struct PoolState {
 pub struct FleetStatus {
     pub url: String,
     pub house: String,
-    pub share: String,
     pub last_ok_at: Option<i64>,
     pub last_error: Option<String>,
-    /// Ledger records written but not yet accepted by the fleet.
-    pub pending_records: usize,
 }
 
 impl State {
@@ -1028,5 +1025,18 @@ mod tests {
         expire_drain(&dir, 20).unwrap();
         assert!(!drain_path(&dir).exists());
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_state_file_from_an_older_version_still_parses() {
+        let state: State = serde_json::from_str(
+            r#"{"host":"studio","pid":1,"fleet":{"url":"https://fleet.example.workers.dev",
+            "house":"H","share":"repos","last_ok_at":5,"last_error":null,"pending_records":3}}"#,
+        )
+        .unwrap();
+        let fleet = state.fleet.unwrap();
+        assert_eq!(fleet.house, "H");
+        assert_eq!(fleet.last_ok_at, Some(5));
+        assert!(fleet.last_error.is_none());
     }
 }
