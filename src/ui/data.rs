@@ -7,15 +7,13 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
 use crate::config::Config;
-use crate::fleet::{self, FleetJob, FleetView};
+use crate::fleet::{self, FleetView};
 use crate::health::{self, State};
 use crate::ledger::{self, JobRecord};
 use crate::{paths, timefmt};
 
 const LOCAL_EVERY: Duration = Duration::from_secs(1);
 const FLEET_EVERY: Duration = Duration::from_secs(20);
-/// Fleet history the History tab can show.
-const FLEET_HISTORY_DAYS: i64 = 35;
 
 #[derive(Clone, Default)]
 pub struct Snapshot {
@@ -26,7 +24,6 @@ pub struct Snapshot {
     pub state: Option<State>,
     pub ledger: Arc<Vec<JobRecord>>,
     pub fleet: Option<FleetView>,
-    pub fleet_jobs: Arc<Vec<FleetJob>>,
     pub fleet_error: Option<String>,
     pub fleet_at: Option<i64>,
 }
@@ -134,17 +131,12 @@ fn run(config_path: &Path, loader: &Loader, ctx: &eframe::egui::Context) {
             redraw = true;
             let result = rt.block_on(async {
                 let client = fleet::Client::from_config(&config)?.expect("fleet configured");
-                let view = client.view().await?;
-                let jobs = client
-                    .jobs(timefmt::now() - FLEET_HISTORY_DAYS * 86400, 1000)
-                    .await?;
-                anyhow::Ok((view, jobs))
+                anyhow::Ok(client.view().await?)
             });
             let mut snap = loader.snapshot.lock().unwrap();
             match result {
-                Ok((view, jobs)) => {
+                Ok(view) => {
                     snap.fleet = Some(view);
-                    snap.fleet_jobs = Arc::new(jobs);
                     snap.fleet_error = None;
                     snap.fleet_at = Some(timefmt::now());
                 }

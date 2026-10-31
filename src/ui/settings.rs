@@ -5,9 +5,8 @@ use eframe::egui::{self, RichText, Ui};
 
 use super::App;
 use super::data::Snapshot;
-use super::fleet_tab::share_choice;
 use super::widgets::{self, MUTED, OK};
-use crate::config::{Config, Share};
+use crate::config::Config;
 
 #[derive(Default)]
 pub struct SettingsUi {
@@ -29,8 +28,6 @@ struct Form {
 #[derive(Clone, PartialEq)]
 struct FleetForm {
     house: String,
-    share: Share,
-    hash_private: bool,
 }
 
 impl Form {
@@ -48,8 +45,6 @@ impl Form {
                 .collect(),
             fleet: config.fleet.as_ref().map(|f| FleetForm {
                 house: f.house.clone(),
-                share: f.share,
-                hash_private: f.hash_private_repos,
             }),
         }
     }
@@ -90,8 +85,6 @@ impl Form {
         {
             let fleet = table(&mut doc, "fleet");
             fleet["house"] = value(f.house.trim());
-            fleet["share"] = value(f.share.as_str());
-            fleet["hash_private_repos"] = value(f.hash_private);
         }
         let out = doc.to_string();
         Config::parse(&out)?;
@@ -239,16 +232,20 @@ pub fn show(ui: &mut Ui, app: &mut App, snap: &Snapshot) {
                                 .size(11.5)
                                 .color(MUTED),
                         )
-                        .on_hover_text("Readable only by you. Join again with a new invite to replace it.");
+                        .on_hover_text("Readable only by you. Join again with the enroll key to replace it.");
                         ui.end_row();
                         ui.label(RichText::new("Heartbeat").color(MUTED));
                         ui.label(format!("every {}s, plus after each job", cfg.heartbeat_secs.max(15)));
                         ui.end_row();
                     });
-                widgets::section(ui, "What this machine shares", None);
-                share_choice(ui, &mut f.share);
                 ui.add_space(4.0);
-                ui.checkbox(&mut f.hash_private, "Send private repo names as a short hash");
+                ui.label(
+                    RichText::new(
+                        "Shares pool types, slot counts and savings totals. Never repo, workflow or job names.",
+                    )
+                    .size(11.5)
+                    .color(MUTED),
+                );
             }
             _ => {
                 ui.label(RichText::new("Not part of a fleet. Join one from the Fleet tab.").color(MUTED));
@@ -375,7 +372,6 @@ heartbeat_secs = 30
         form.pools[0].2 = 3;
         form.electricity = 0.31;
         form.fleet.as_mut().unwrap().house = "Zack's house".into();
-        form.fleet.as_mut().unwrap().share = Share::Totals;
         let out = form.apply(&Form::from(&config), CONFIG).unwrap();
         assert!(out.starts_with("# my comment"));
         assert!(out.contains("# kept"));
@@ -385,7 +381,6 @@ heartbeat_secs = 30
         assert_eq!(back.pricing.electricity_usd_per_kwh, 0.31);
         let fleet = back.fleet.unwrap();
         assert_eq!(fleet.house, "Zack's house");
-        assert_eq!(fleet.share, Share::Totals);
         assert_eq!(fleet.heartbeat_secs, 30);
         // New sections go after the existing ones; untouched settings aren't written.
         assert!(out.find("[pricing]").unwrap() > out.find("[fleet]").unwrap());

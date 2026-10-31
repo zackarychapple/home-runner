@@ -5,27 +5,23 @@ use std::collections::BTreeMap;
 
 use eframe::egui::{self, RichText, Ui, Vec2};
 
+use super::App;
 use super::data::Snapshot;
 use super::widgets::{self, BAD, MUTED, OK, WARN};
-use super::{App, Scope};
 use crate::health::{Phase, PoolState, SlotState};
 use crate::ledger::JobRecord;
 use crate::live::LiveJob;
 use crate::timefmt;
 
-/// A running job wherever it is.
+/// A job running on this machine.
 struct Running<'a> {
-    host: &'a str,
-    house: Option<&'a str>,
     pool: &'a PoolState,
     slot: &'a SlotState,
     job: &'a LiveJob,
-    /// Only this machine's jobs can be stopped from here.
-    local: bool,
 }
 
 pub fn show(ui: &mut Ui, app: &mut App, snap: &Snapshot) {
-    if !snap.daemon_running() && app.scope == Scope::Host {
+    if !snap.daemon_running() {
         widgets::card(ui, |ui| {
             ui.horizontal(|ui| {
                 widgets::dot(ui, BAD);
@@ -41,9 +37,7 @@ pub fn show(ui: &mut Ui, app: &mut App, snap: &Snapshot) {
         });
     }
 
-    if app.scope == Scope::Host
-        && let Some(state) = snap.state.as_ref().filter(|_| snap.daemon_running())
-    {
+    if let Some(state) = snap.state.as_ref().filter(|_| snap.daemon_running()) {
         supervisor_notices(ui, app, snap, state);
     }
 
@@ -54,45 +48,10 @@ pub fn show(ui: &mut Ui, app: &mut App, snap: &Snapshot) {
         .filter(|_| snap.daemon_running())
         .map(|s| s.pools())
         .unwrap_or_default();
-    match app.scope {
-        Scope::Host => {
-            let host = snap.state.as_ref().map_or("", |s| s.host.as_str());
-            for pool in &local_pools {
-                for slot in &pool.slots {
-                    if let Some(job) = &slot.job {
-                        running.push(Running {
-                            host,
-                            house: None,
-                            pool,
-                            slot,
-                            job,
-                            local: true,
-                        });
-                    }
-                }
-            }
-        }
-        Scope::Fleet => {
-            if let Some(view) = &snap.fleet {
-                coverage_gaps(ui, snap);
-                for house in &view.houses {
-                    for host in house.hosts.iter().filter(|h| h.online) {
-                        for pool in &host.pools {
-                            for slot in &pool.slots {
-                                if let Some(job) = &slot.job {
-                                    running.push(Running {
-                                        host: &host.host,
-                                        house: Some(&house.house),
-                                        pool,
-                                        slot,
-                                        job,
-                                        local: host.host == snap.host(),
-                                    });
-                                }
-                            }
-                        }
-                    }
-                }
+    for pool in &local_pools {
+        for slot in &pool.slots {
+            if let Some(job) = &slot.job {
+                running.push(Running { pool, slot, job });
             }
         }
     }
@@ -116,41 +75,19 @@ pub fn show(ui: &mut Ui, app: &mut App, snap: &Snapshot) {
         ui.add_space(6.0);
     }
 
-    match app.scope {
-        Scope::Host => {
-            let right = snap
-                .state
-                .as_ref()
-                .filter(|_| snap.daemon_running())
-                .map(|s| format!("GitHub answered {}", widgets::ago(s.github_ok_at)));
-            widgets::section(ui, "Runner slots", right);
-            if !local_pools.is_empty() {
-                pools(ui, &local_pools);
-            } else {
-                ui.label(RichText::new("No live slot information.").color(MUTED));
-            }
-        }
-        Scope::Fleet => {
-            if let Some(view) = &snap.fleet {
-                for house in &view.houses {
-                    for host in &house.hosts {
-                        widgets::section(
-                            ui,
-                            &format!("{} · {}", host.host, house.house),
-                            Some(if host.online {
-                                "online".into()
-                            } else {
-                                format!("last seen {}", widgets::ago(host.last_seen))
-                            }),
-                        );
-                        pools(ui, &host.pools);
-                    }
-                }
-            }
-        }
+    let right = snap
+        .state
+        .as_ref()
+        .filter(|_| snap.daemon_running())
+        .map(|s| format!("GitHub answered {}", widgets::ago(s.github_ok_at)));
+    widgets::section(ui, "Runner slots", right);
+    if !local_pools.is_empty() {
+        pools(ui, &local_pools);
+    } else {
+        ui.label(RichText::new("No live slot information.").color(MUTED));
     }
 
-    if app.scope == Scope::Host && !snap.ledger.is_empty() {
+    if !snap.ledger.is_empty() {
         widgets::section(ui, "Just finished", None);
         widgets::card(ui, |ui| {
             for r in snap.ledger.iter().rev().take(3) {
@@ -224,11 +161,7 @@ fn job_card(
                 }
             });
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
-                let place = match r.house {
-                    Some(house) => format!("{} · {house} · {}", r.host, r.pool.name),
-                    None => r.pool.name.clone(),
-                };
-                widgets::tag(ui, place);
+                widgets::tag(ui, r.pool.name.clone());
             });
         });
         ui.add_space(6.0);
@@ -335,17 +268,14 @@ fn job_card(
             {
                 ui.ctx().open_url(egui::OpenUrl::new_tab(url));
             }
-            if r.local
-                && ui
-                    .button("Logs")
-                    .on_hover_text("Open the log folder")
-                    .clicked()
+            if ui
+                .button("Logs")
+                .on_hover_text("Open the log folder")
+                .clicked()
             {
                 widgets::reveal(&snap.data_dir.join("logs"));
             }
-            if r.local
-                && let Some(runner) = &r.slot.runner
-            {
+            if let Some(runner) = &r.slot.runner {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.button(RichText::new("Stop job").color(BAD)).clicked() {
                         let what = format!(
@@ -485,7 +415,7 @@ fn callout(ui: &mut Ui, color: egui::Color32, add: impl FnOnce(&mut Ui)) {
 }
 
 /// Callouts for platforms only offline machines can run, so jobs for them will queue.
-fn coverage_gaps(ui: &mut Ui, snap: &Snapshot) {
+pub(super) fn coverage_gaps(ui: &mut Ui, snap: &Snapshot) {
     let Some(view) = &snap.fleet else { return };
     let mut online = std::collections::HashSet::new();
     let mut offline: BTreeMap<(String, String), (String, String, i64)> = BTreeMap::new();

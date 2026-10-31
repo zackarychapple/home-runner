@@ -32,13 +32,6 @@ enum Tab {
     Settings,
 }
 
-/// Whether Active and History show this machine or every machine in the fleet.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum Scope {
-    Host,
-    Fleet,
-}
-
 /// Something running off the UI thread (restart, doctor, join) and what it reports back.
 struct Task {
     label: String,
@@ -49,7 +42,6 @@ pub struct App {
     loader: Arc<Loader>,
     stats: app::App,
     tab: Tab,
-    scope: Scope,
     history: history::HistoryUi,
     settings: settings::SettingsUi,
     join: fleet_tab::JoinUi,
@@ -80,7 +72,6 @@ pub fn run(config_path: PathBuf, ledgers: Vec<PathBuf>, since: String) -> Result
                 stats: app::App::new(cc, ledgers, &since),
                 loader,
                 tab: Tab::Active,
-                scope: Scope::Host,
                 history: Default::default(),
                 settings: Default::default(),
                 join: Default::default(),
@@ -159,28 +150,7 @@ impl App {
         ui.horizontal(|ui| {
             ui.label(RichText::new("home-runner").strong().size(15.0));
             ui.add_space(10.0);
-            let joined = snap.config.as_ref().is_some_and(|c| c.fleet.is_some());
-            let host = snap.host();
-            ui.selectable_value(&mut self.scope, Scope::Host, host);
-            let houses = snap.fleet.as_ref().map_or(0, |f| f.houses.len());
-            ui.add_enabled_ui(joined, |ui| {
-                ui.selectable_value(
-                    &mut self.scope,
-                    Scope::Fleet,
-                    if houses > 0 {
-                        format!(
-                            "Fleet · {houses} house{}",
-                            if houses == 1 { "" } else { "s" }
-                        )
-                    } else {
-                        "Fleet".into()
-                    },
-                )
-                .on_disabled_hover_text("Join a fleet in the Fleet tab");
-            });
-            if !joined {
-                self.scope = Scope::Host;
-            }
+            ui.label(RichText::new(snap.host()).color(MUTED));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let (color, text) = status_line(snap);
                 ui.label(RichText::new(text).size(12.0).color(MUTED));

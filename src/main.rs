@@ -30,7 +30,7 @@ mod ui;
 
 use std::path::{Path, PathBuf};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
 use tokio_util::sync::CancellationToken;
 
@@ -440,21 +440,20 @@ enum PrereqAction {
 
 #[derive(Subcommand)]
 enum FleetCommand {
-    /// Join with an invite code: stores this machine's token and adds a [fleet] section to the config.
+    /// Join with the fleet's enroll key: stores this machine's token and adds a [fleet] section to the config.
     Join {
         #[command(flatten)]
         config: ConfigArg,
         /// The fleet's Worker URL, e.g. https://fleet.example.workers.dev
         #[arg(long)]
         url: String,
+        /// The fleet's enroll key (used once, to get this machine's own token). Or set
+        /// HOME_RUNNER_FLEET_KEY, e.g. `HOME_RUNNER_FLEET_KEY=$(op read ...) home-runner fleet join ...`.
         #[arg(long)]
-        invite: String,
+        key: Option<String>,
         /// Where this machine is, as the rest of the fleet will see it, e.g. "Zack's house".
         #[arg(long)]
         house: String,
-        /// How much job detail to share.
-        #[arg(long, value_enum, default_value = "repos")]
-        share: config::Share,
     },
     /// Fleet-wide totals, houses and machines.
     Status {
@@ -515,16 +514,15 @@ async fn fleet_command(command: FleetCommand) -> Result<()> {
         FleetCommand::Join {
             config,
             url,
-            invite,
+            key,
             house,
-            share,
         } => {
-            let name =
-                fleet::join_and_configure(&config.path(), &url, &invite, &house, share).await?;
-            println!(
-                "joined fleet {name:?} as {house:?}, sharing {}",
-                share.as_str()
-            );
+            let key = key
+                .or_else(|| std::env::var("HOME_RUNNER_FLEET_KEY").ok())
+                .filter(|k| !k.trim().is_empty())
+                .context("pass --key or set HOME_RUNNER_FLEET_KEY")?;
+            let name = fleet::join_and_configure(&config.path(), &url, key.trim(), &house).await?;
+            println!("joined fleet {name:?} as {house:?}");
             println!("added [fleet] to {}", config.path().display());
             println!("restart home-runner (`home-runner install` again) to start reporting");
             Ok(())
@@ -535,34 +533,35 @@ async fn fleet_command(command: FleetCommand) -> Result<()> {
                 anyhow::bail!("this machine hasn't joined a fleet (see `home-runner fleet join`)");
             };
             let view = client.view().await?;
-            let m = &view.month;
             println!("fleet {}", view.fleet);
-            println!(
-                "  this month: {} jobs, {:.1}h, saved {} vs GitHub ({} vs Depot), power {}",
-                m.jobs,
-                m.runner_secs / 3600.0,
-                ledger::usd(m.saved_vs_github_usd),
-                ledger::usd(m.saved_vs_depot_usd),
-                ledger::usd(m.own_usd)
-            );
+            for (label, t) in [("this month", &view.month), ("all time", &view.all_time)] {
+                println!(
+                    "  {label:<10}: {} jobs, {:.1}h, saved {} vs GitHub ({} vs Depot), power {}",
+                    t.jobs,
+                    t.runner_secs / 3600.0,
+                    ledger::usd(t.saved_vs_github_usd),
+                    ledger::usd(t.saved_vs_depot_usd),
+                    ledger::usd(t.own_usd)
+                );
+            }
             for house in &view.houses {
                 println!(
-                    "\n  {}  ({} saved this month)",
+                    "\n  {}  ({} saved this month, {} in all)",
                     house.house,
-                    ledger::usd(house.saved_month_usd)
+                    ledger::usd(house.saved_month_usd),
+                    ledger::usd(house.saved_total_usd)
                 );
                 for h in &house.hosts {
-                    let slots: Vec<_> = h.pools.iter().flat_map(|p| &p.slots).collect();
-                    let busy = slots
-                        .iter()
-                        .filter(|s| s.phase == health::Phase::Busy)
-                        .count();
+                    let slots = h.slots();
                     println!(
-                        "    {:<22} {:<8} {}/{} busy  {}",
+                        "    {:<22} {:<8} {} open, {} busy of {}  saved {} this month, {} in all  {}",
                         h.host,
                         if h.online { "online" } else { "offline" },
-                        busy,
-                        slots.len(),
+                        slots.open(),
+                        slots.busy,
+                        slots.total(),
+                        ledger::usd(h.saved_month_usd),
+                        ledger::usd(h.saved_total_usd),
                         if h.online {
                             format!("v{}", h.version)
                         } else {
